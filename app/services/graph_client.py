@@ -62,9 +62,9 @@ async def get_shared_http_client() -> httpx.AsyncClient:
     global _shared_http
     if _shared_http is None or _shared_http.is_closed:
         _shared_http = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
+            timeout=httpx.Timeout(60.0, connect=10.0),
             trust_env=False,
-            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+            limits=httpx.Limits(max_keepalive_connections=12, max_connections=20),
         )
     return _shared_http
 
@@ -187,7 +187,7 @@ class GraphClient:
         self,
         url: str | None = None,
         *,
-        top: int = 50,
+        top: int = 100,
         newest_first: bool = True,
     ) -> dict:
         access_token = self.ensure_access_token()

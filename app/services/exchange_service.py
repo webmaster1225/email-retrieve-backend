@@ -74,6 +74,7 @@ def _normalize_graph_message(item: dict, contact_email: str, user_email: str | N
         "conversation_id": item.get("conversationId"),
         "sent_datetime": _coerce_utc(sent_dt),
         "has_attachments": bool(item.get("hasAttachments")),
+        "outlook_weblink": item.get("webLink"),
     }
 
 
@@ -86,6 +87,7 @@ def _normalize_local_message(message: EmailMessage) -> dict:
         "conversation_id": message.conversation_id,
         "sent_datetime": _coerce_utc(message.sent_datetime),
         "has_attachments": message.has_attachments,
+        "outlook_weblink": message.outlook_weblink,
     }
 
 
@@ -241,3 +243,20 @@ async def gather_exchange_data(
     stats = compute_exchange_stats(merged, data_source=data_source)
     _ = full_name, company_name  # used by caller for AI prompt
     return stats, merged
+
+
+def serialize_exchange_messages(messages: list[dict], *, limit: int = 5) -> list[dict]:
+    items: list[dict] = []
+    for message in messages[:limit]:
+        sent_dt = message.get("sent_datetime")
+        items.append(
+            {
+                "subject": message.get("subject"),
+                "body_preview": message.get("body_preview"),
+                "sent_datetime": sent_dt.isoformat() if sent_dt else None,
+                "direction": message.get("direction") or "unknown",
+                "outlook_weblink": message.get("outlook_weblink"),
+                "has_attachments": bool(message.get("has_attachments")),
+            }
+        )
+    return items

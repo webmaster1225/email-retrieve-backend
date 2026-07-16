@@ -67,8 +67,17 @@ def start_sync(background_tasks: BackgroundTasks, db: Session = Depends(get_db))
     return sync_run
 
 
+@router.post("/fail-running", response_model=list[SyncRunOut])
+def fail_running_syncs(db: Session = Depends(get_db)):
+    """Clear zombie sync rows stuck at status=running so a new sync can start."""
+    service = SyncService(db)
+    return service.fail_running_syncs()
+
+
 @router.get("/status", response_model=SyncRunOut | None)
 def latest_sync_status(db: Session = Depends(get_db)):
+    # Auto-fail hung runs so the UI doesn't show "syncing" forever
+    SyncService(db).get_active_run()
     run = db.query(SyncRun).order_by(SyncRun.started_at.desc()).first()
     return run
 

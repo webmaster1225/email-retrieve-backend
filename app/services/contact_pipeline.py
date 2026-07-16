@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timezone
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.contact import Contact, ContactContext, ContactEmailLink
@@ -19,12 +19,15 @@ def upsert_recipient_link(
     email: str,
     display_name: str | None,
     recipient_type: str,
+    contact_cache: dict[str, Contact] | None = None,
 ) -> Contact | None:
     if not email or is_noise_email(email):
         return None
 
     company_name, company_domain, is_internal, is_personal = resolve_company(email, display_name)
-    contact = db.query(Contact).filter(Contact.primary_email == email).one_or_none()
+    contact = contact_cache.get(email) if contact_cache is not None else None
+    if contact is None:
+        contact = db.query(Contact).filter(Contact.primary_email == email).one_or_none()
 
     if contact is None:
         contact = Contact(
@@ -47,6 +50,9 @@ def upsert_recipient_link(
         contact.is_internal = is_internal
         contact.is_personal_email = is_personal
 
+    if contact_cache is not None:
+        contact_cache[email] = contact
+
     existing_link = (
         db.query(ContactEmailLink)
         .filter(
@@ -67,7 +73,12 @@ def upsert_recipient_link(
     return contact
 
 
-def process_message_recipients(db: Session, message: EmailMessage) -> list[str]:
+def process_message_recipients(
+    db: Session,
+    message: EmailMessage,
+    *,
+    contact_cache: dict[str, Contact] | None = None,
+) -> list[str]:
     touched_contact_ids: list[str] = []
     seen: set[tuple[str, str]] = set()
     recipient_groups = [
@@ -91,13 +102,19 @@ def process_message_recipients(db: Session, message: EmailMessage) -> list[str]:
                 email=email,
                 display_name=display_name,
                 recipient_type=recipient_type,
+                contact_cache=contact_cache,
             )
             if contact and contact.id not in touched_contact_ids:
                 touched_contact_ids.append(contact.id)
     return touched_contact_ids
 
 
-def process_inbound_sender(db: Session, message: EmailMessage) -> list[str]:
+def process_inbound_sender(
+    db: Session,
+    message: EmailMessage,
+    *,
+    contact_cache: dict[str, Contact] | None = None,
+) -> list[str]:
     touched: list[str] = []
     if not message.sender_email or is_noise_email(message.sender_email):
         return touched
@@ -110,6 +127,7 @@ def process_inbound_sender(db: Session, message: EmailMessage) -> list[str]:
         email=email,
         display_name=display_name,
         recipient_type="from",
+        contact_cache=contact_cache,
     )
     if contact and contact.id not in touched:
         touched.append(contact.id)
@@ -117,8 +135,6 @@ def process_inbound_sender(db: Session, message: EmailMessage) -> list[str]:
 
 
 def _update_reply_status(contact: Contact, messages: list[EmailMessage]) -> None:
-    from datetime import timezone
-
     outbound = [m for m in messages if (m.direction or "outbound") == "outbound"]
     inbound = [m for m in messages if m.direction == "inbound"]
 
@@ -144,20 +160,54 @@ def _update_reply_status(contact: Contact, messages: list[EmailMessage]) -> None
 
 
 def rebuild_contact_aggregates(db: Session, contact_ids: list[str] | None = None) -> int:
+    """Rebuild contact stats/threads/scores with batched queries (no per-thread N+1)."""
     query = db.query(Contact)
     if contact_ids:
+        if not contact_ids:
+            return 0
         query = query.filter(Contact.id.in_(contact_ids))
     contacts = query.all()
-    updated = 0
+    if not contacts:
+        return 0
 
-    for contact in contacts:
-        messages = (
-            db.query(EmailMessage)
-            .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
-            .filter(ContactEmailLink.contact_id == contact.id)
-            .order_by(EmailMessage.sent_datetime.asc())
-            .all()
-        )
+    ids = [c.id for c in contacts]
+    contact_by_id = {c.id: c for c in contacts}
+
+    # One query: all messages for these contacts
+    rows = (
+        db.query(ContactEmailLink.contact_id, EmailMessage)
+        .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
+        .filter(ContactEmailLink.contact_id.in_(ids))
+        .order_by(EmailMessage.sent_datetime.asc())
+        .all()
+    )
+    messages_by_contact: dict[str, list[EmailMessage]] = defaultdict(list)
+    seen_msg: dict[str, set[str]] = defaultdict(set)
+    for contact_id, message in rows:
+        if message.id in seen_msg[contact_id]:
+            continue
+        seen_msg[contact_id].add(message.id)
+        messages_by_contact[contact_id].append(message)
+
+    # Existing threads for these contacts (one query)
+    existing_threads = (
+        db.query(ConversationThread)
+        .filter(ConversationThread.contact_id.in_(ids))
+        .all()
+    )
+    thread_map: dict[tuple[str, str], ConversationThread] = {
+        (t.contact_id, t.conversation_id): t for t in existing_threads
+    }
+
+    # Existing contexts (one query)
+    existing_contexts = (
+        db.query(ContactContext).filter(ContactContext.contact_id.in_(ids)).all()
+    )
+    context_map = {ctx.contact_id: ctx for ctx in existing_contexts}
+
+    updated = 0
+    for contact_id, messages in messages_by_contact.items():
+        contact = contact_by_id[contact_id]
         if not messages:
             continue
 
@@ -168,55 +218,38 @@ def rebuild_contact_aggregates(db: Session, contact_ids: list[str] | None = None
         contact.first_contacted_at = outbound_messages[0].sent_datetime
         contact.last_contacted_at = outbound_messages[-1].sent_datetime
         contact.email_count = len(outbound_messages)
-
         _update_reply_status(contact, messages)
 
-        thread_rows = (
-            db.query(
-                EmailMessage.conversation_id,
-                func.min(EmailMessage.sent_datetime),
-                func.max(EmailMessage.sent_datetime),
-                func.count(EmailMessage.id),
-            )
-            .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
-            .filter(ContactEmailLink.contact_id == contact.id, EmailMessage.conversation_id.isnot(None))
-            .group_by(EmailMessage.conversation_id)
-            .all()
-        )
-        contact.thread_count = len(thread_rows)
+        # Group messages by conversation in memory
+        by_conversation: dict[str, list[EmailMessage]] = defaultdict(list)
+        for message in messages:
+            if message.conversation_id:
+                by_conversation[message.conversation_id].append(message)
 
-        for conversation_id, first_at, last_at, count in thread_rows:
-            thread_messages = (
-                db.query(EmailMessage)
-                .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
-                .filter(
-                    ContactEmailLink.contact_id == contact.id,
-                    EmailMessage.conversation_id == conversation_id,
-                )
-                .order_by(EmailMessage.sent_datetime.desc())
-                .all()
-            )
-            latest = thread_messages[0]
-            subjects = sorted({m.subject or "" for m in thread_messages if m.subject})
-            thread = (
-                db.query(ConversationThread)
-                .filter(
-                    ConversationThread.contact_id == contact.id,
-                    ConversationThread.conversation_id == conversation_id,
-                )
-                .one_or_none()
-            )
+        contact.thread_count = len(by_conversation)
+
+        for conversation_id, thread_messages in by_conversation.items():
+            thread_messages_sorted = sorted(thread_messages, key=lambda m: m.sent_datetime)
+            latest = thread_messages_sorted[-1]
+            first_at = thread_messages_sorted[0].sent_datetime
+            last_at = latest.sent_datetime
+            subjects = sorted({m.subject or "" for m in thread_messages_sorted if m.subject})
+            key = (contact.id, conversation_id)
+            thread = thread_map.get(key)
             if thread is None:
                 thread = ConversationThread(contact_id=contact.id, conversation_id=conversation_id)
                 db.add(thread)
+                thread_map[key] = thread
             thread.first_message_at = first_at
             thread.last_message_at = last_at
-            thread.message_count = count
+            thread.message_count = len(thread_messages_sorted)
             thread.latest_subject = latest.subject
             thread.latest_preview = latest.body_preview
             thread.latest_outlook_weblink = latest.outlook_weblink
             thread.subjects_all = subjects
-            thread.detected_keywords = detect_topics(subjects, [m.body_preview or "" for m in thread_messages])
+            thread.detected_keywords = detect_topics(
+                subjects, [m.body_preview or "" for m in thread_messages_sorted]
+            )
             thread.updated_at = datetime.utcnow()
 
         subjects = [m.subject or "" for m in outbound_messages]
@@ -251,10 +284,16 @@ def rebuild_contact_aggregates(db: Session, contact_ids: list[str] | None = None
         latest_meaningful = next(
             (m for m in reversed(outbound_messages) if not is_trivial_preview(m.body_preview)), latest
         )
-        context = contact.context
+        # Denormalized list fields — avoids a join on every contacts page load
+        contact.last_subject = latest.subject
+        contact.last_preview = latest.body_preview
+        contact.latest_outlook_weblink = latest.outlook_weblink
+
+        context = context_map.get(contact.id)
         if context is None:
             context = ContactContext(contact_id=contact.id)
             db.add(context)
+            context_map[contact.id] = context
 
         topic_text = ", ".join(topics) if topics else "general correspondence"
         context.auto_context_short = (

@@ -59,7 +59,7 @@ def on_startup() -> None:
 
 @app.get("/api/v1/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "database": settings.database_url.split("://", 1)[0]}
 
 
 app.include_router(auth.router, prefix="/api/v1")

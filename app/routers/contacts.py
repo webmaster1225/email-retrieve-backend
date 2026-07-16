@@ -4,7 +4,7 @@ from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import exists, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -13,6 +13,7 @@ from app.models.message import EmailMessage
 from app.models.sync import SyncRun
 from app.schemas import ContactDetail, ContactListItem, ContactUpdate, StatsOut
 from app.services.company_resolver import best_display_name, resolve_company
+from app.services.exchange_service import gather_exchange_data, serialize_exchange_messages
 from app.services.graph_client import GraphAuthError, GraphClient
 from app.services.sent_contacts import extract_contacts_from_messages
 from app.services.text_utils import normalize_email
@@ -20,12 +21,31 @@ from app.services.text_utils import normalize_email
 router = APIRouter(prefix="/contacts", tags=["contacts"])
 
 REVIEW_STATUSES = {"pending", "approved", "denied"}
+_HAS_TEST_SEED: bool | None = None
 
 
-def _hydrate_list_item(contact: Contact) -> ContactListItem:
+def _has_test_seed_messages(db: Session) -> bool:
+    global _HAS_TEST_SEED
+    if _HAS_TEST_SEED is not None:
+        return _HAS_TEST_SEED
+    _HAS_TEST_SEED = (
+        db.query(EmailMessage.id)
+        .filter(EmailMessage.graph_message_id.like("test-%"))
+        .limit(1)
+        .first()
+        is not None
+    )
+    return _HAS_TEST_SEED
+
+
+def _hydrate_list_item(
+    contact: Contact,
+    latest_message: EmailMessage | None = None,
+    *,
+    resolve_from_links: bool = True,
+) -> ContactListItem:
     context: ContactContext | None = contact.context
-    latest_message = None
-    if contact.email_links:
+    if latest_message is None and resolve_from_links and contact.email_links:
         latest_message = max(contact.email_links, key=lambda link: link.message.sent_datetime).message
     return ContactListItem(
         id=contact.id,
@@ -58,13 +78,50 @@ def _hydrate_list_item(contact: Contact) -> ContactListItem:
         detected_role=context.detected_role if context else None,
         ai_seniority=context.ai_seniority if context else None,
         ai_outreach_intelligence=context.ai_outreach_intelligence if context else None,
-        last_subject=latest_message.subject if latest_message else None,
-        last_preview=latest_message.body_preview if latest_message else None,
-        latest_outlook_weblink=latest_message.outlook_weblink if latest_message else None,
+        last_subject=(latest_message.subject if latest_message else None)
+        or getattr(contact, "last_subject", None),
+        last_preview=(latest_message.body_preview if latest_message else None)
+        or getattr(contact, "last_preview", None),
+        latest_outlook_weblink=(latest_message.outlook_weblink if latest_message else None)
+        or getattr(contact, "latest_outlook_weblink", None),
         latest_message_id=latest_message.id if latest_message else None,
-        has_ai_summary=bool(context and context.ai_summary),
+        has_ai_summary=bool(context and (context.ai_summary_generated_at or context.ai_summary)),
         has_outreach_intelligence=bool(context and context.ai_outreach_intelligence),
     )
+
+
+def _latest_messages_for_contacts(db: Session, contact_ids: list[str]) -> dict[str, EmailMessage]:
+    """Fetch only the single most recent message per contact in one batch query.
+
+    Avoids loading every linked message for every contact just to display the
+    latest subject / preview / weblink in the list.
+    """
+    if not contact_ids:
+        return {}
+    latest_dt = (
+        db.query(
+            ContactEmailLink.contact_id.label("cid"),
+            func.max(EmailMessage.sent_datetime).label("max_dt"),
+        )
+        .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
+        .filter(ContactEmailLink.contact_id.in_(contact_ids))
+        .group_by(ContactEmailLink.contact_id)
+        .subquery()
+    )
+    rows = (
+        db.query(ContactEmailLink.contact_id, EmailMessage)
+        .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
+        .join(
+            latest_dt,
+            (latest_dt.c.cid == ContactEmailLink.contact_id)
+            & (latest_dt.c.max_dt == EmailMessage.sent_datetime),
+        )
+        .all()
+    )
+    result: dict[str, EmailMessage] = {}
+    for contact_id, message in rows:
+        result.setdefault(contact_id, message)
+    return result
 
 
 def _parse_exclude_emails(raw: str | None) -> set[str]:
@@ -191,8 +248,13 @@ def _list_outlook_from_local(
 ) -> dict:
     query = (
         db.query(Contact)
-        .outerjoin(ContactContext, ContactContext.contact_id == Contact.id)
-        .options(joinedload(Contact.context), joinedload(Contact.email_links).joinedload(ContactEmailLink.message))
+        .options(
+            joinedload(Contact.context)
+            .defer(ContactContext.ai_summary)
+            .defer(ContactContext.ai_follow_up_draft)
+            .defer(ContactContext.auto_context_detailed)
+            .defer(ContactContext.ai_relationship_analysis)
+        )
         .filter(Contact.is_internal.is_(False), Contact.is_excluded.is_(False))
     )
     if exclude_emails:
@@ -211,7 +273,13 @@ def _list_outlook_from_local(
     rows = query.offset(offset).limit(page_size + 1).all()
     has_more = len(rows) > page_size
     rows = rows[:page_size]
-    items = [_local_contact_to_outlook(_hydrate_list_item(contact).model_dump()) for contact in rows]
+    latest_by_contact = _latest_messages_for_contacts(db, [c.id for c in rows])
+    items = [
+        _local_contact_to_outlook(
+            _hydrate_list_item(contact, latest_by_contact.get(contact.id), resolve_from_links=False).model_dump()
+        )
+        for contact in rows
+    ]
     next_cursor = f"local:{offset + len(items)}" if has_more else None
     return {"items": items, "next_link": next_cursor, "total": None, "source": "local"}
 
@@ -359,6 +427,30 @@ def update_contact_by_email(contact_email: str, payload: ContactUpdate, db: Sess
     return get_contact(contact.id, db)
 
 
+@router.get("/by-email/{contact_email:path}/messages")
+async def contact_messages_by_email(
+    contact_email: str,
+    limit: int = Query(5, ge=1, le=20),
+    db: Session = Depends(get_db),
+):
+    email = normalize_email(contact_email)
+    if not email:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    local = db.query(Contact).filter(Contact.primary_email == email).one_or_none()
+    try:
+        _stats, messages = await gather_exchange_data(
+            db,
+            email,
+            full_name=local.full_name if local else None,
+            company_name=local.company_name if local else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"items": serialize_exchange_messages(messages, limit=limit)}
+
+
 @router.get("/outlook/{contact_email:path}")
 async def get_outlook_contact(contact_email: str, db: Session = Depends(get_db)):
     email = normalize_email(contact_email)
@@ -414,27 +506,35 @@ def list_contacts(
     order: str = "desc",
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    include_total: bool = Query(True),
 ):
-    query = (
-        db.query(Contact)
-        .outerjoin(ContactContext, ContactContext.contact_id == Contact.id)
-        .options(joinedload(Contact.context), joinedload(Contact.email_links).joinedload(ContactEmailLink.message))
+    context_load = (
+        joinedload(Contact.context)
+        .defer(ContactContext.ai_summary)
+        .defer(ContactContext.ai_follow_up_draft)
+        .defer(ContactContext.auto_context_detailed)
+        .defer(ContactContext.ai_relationship_analysis)
+        .defer(ContactContext.auto_context_short)
+        .defer(ContactContext.meaningful_previews)
     )
+    query = db.query(Contact).options(context_load)
+    if keyword:
+        query = query.outerjoin(ContactContext, ContactContext.contact_id == Contact.id)
 
     if exclude_noise:
         query = query.filter(Contact.is_excluded.is_(False))
 
-    # Hide dev-only test seed contacts (graph_message_id starting with test-)
-    has_real_message = (
-        db.query(ContactEmailLink.id)
-        .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
-        .filter(
-            ContactEmailLink.contact_id == Contact.id,
-            ~EmailMessage.graph_message_id.like("test-%"),
+    if _has_test_seed_messages(db):
+        has_real_message = (
+            db.query(ContactEmailLink.id)
+            .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
+            .filter(
+                ContactEmailLink.contact_id == Contact.id,
+                ~EmailMessage.graph_message_id.like("test-%"),
+            )
+            .exists()
         )
-        .exists()
-    )
-    query = query.filter(has_real_message)
+        query = query.filter(has_real_message)
 
     if exclude_internal:
         query = query.filter(Contact.is_internal.is_(False))
@@ -492,10 +592,18 @@ def list_contacts(
     else:
         query = query.order_by(sort_column.desc().nullslast())
 
-    total = query.count()
+    # Skip the duplicate full-scan count on infinite-scroll pages
+    total: int | None = query.count() if include_total else None
     contacts = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    # Prefer denormalized last_* fields; only query messages for contacts missing them
+    missing_ids = [c.id for c in contacts if not getattr(c, "last_subject", None)]
+    latest_by_contact = _latest_messages_for_contacts(db, missing_ids) if missing_ids else {}
     return {
-        "items": [_hydrate_list_item(c) for c in contacts],
+        "items": [
+            _hydrate_list_item(c, latest_by_contact.get(c.id), resolve_from_links=False)
+            for c in contacts
+        ],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -503,40 +611,45 @@ def list_contacts(
 
 
 @router.get("/stats", response_model=StatsOut)
-async def contact_stats(db: Session = Depends(get_db)):
-    external_filter = (Contact.is_internal.is_(False), Contact.is_excluded.is_(False))
+async def contact_stats(
+    db: Session = Depends(get_db),
+    include_graph_total: bool = False,
+):
+    external = and_(Contact.is_internal.is_(False), Contact.is_excluded.is_(False))
+    counts = db.query(
+        func.count(Contact.id),
+        func.sum(case((external, 1), else_=0)),
+        func.sum(case((Contact.fundraising_relevance_tier == "high", 1), else_=0)),
+        func.sum(case((and_(external, Contact.review_status == "pending"), 1), else_=0)),
+        func.sum(case((and_(external, Contact.review_status == "approved"), 1), else_=0)),
+        func.sum(case((and_(external, Contact.review_status == "denied"), 1), else_=0)),
+    ).one()
+    total_contacts = int(counts[0] or 0)
+    external_contacts = int(counts[1] or 0)
+    high_relevance = int(counts[2] or 0)
+    review_pending = int(counts[3] or 0)
+    review_approved = int(counts[4] or 0)
+    review_denied = int(counts[5] or 0)
 
-    total_contacts = db.query(func.count(Contact.id)).scalar() or 0
-    external_contacts = db.query(func.count(Contact.id)).filter(*external_filter).scalar() or 0
-    high_relevance = (
-        db.query(func.count(Contact.id)).filter(Contact.fundraising_relevance_tier == "high").scalar() or 0
-    )
-    total_messages = db.query(func.count(EmailMessage.id)).scalar() or 0
-    synced_messages = (
-        db.query(func.count(EmailMessage.id))
-        .filter(~EmailMessage.graph_message_id.like("test-%"))
-        .scalar()
-        or 0
-    )
-    review_pending = (
-        db.query(func.count(Contact.id)).filter(*external_filter, Contact.review_status == "pending").scalar() or 0
-    )
-    review_approved = (
-        db.query(func.count(Contact.id)).filter(*external_filter, Contact.review_status == "approved").scalar() or 0
-    )
-    review_denied = (
-        db.query(func.count(Contact.id)).filter(*external_filter, Contact.review_status == "denied").scalar() or 0
-    )
+    msg_counts = db.query(
+        func.count(EmailMessage.id),
+        func.sum(case((~EmailMessage.graph_message_id.like("test-%"), 1), else_=0)),
+    ).one()
+    total_messages = int(msg_counts[0] or 0)
+    synced_messages = int(msg_counts[1] or 0)
 
     graph_sent_total: int | None = None
     sync_complete: bool | None = None
-    try:
-        folder = await GraphClient(db).fetch_sent_items_folder()
-        graph_sent_total = folder.get("totalItemCount")
-        if graph_sent_total is not None:
-            sync_complete = synced_messages >= graph_sent_total
-    except (GraphAuthError, httpx.HTTPError):
-        pass
+    # The live Graph call is slow; only make it when explicitly requested
+    # (e.g. while polling sync progress). Regular page loads stay fast.
+    if include_graph_total:
+        try:
+            folder = await GraphClient(db).fetch_sent_items_folder()
+            graph_sent_total = folder.get("totalItemCount")
+            if graph_sent_total is not None:
+                sync_complete = synced_messages >= graph_sent_total
+        except (GraphAuthError, httpx.HTTPError):
+            pass
 
     last_sync = db.query(SyncRun).filter(SyncRun.status == "completed").order_by(SyncRun.completed_at.desc()).first()
     return StatsOut(

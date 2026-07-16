@@ -7,7 +7,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = BACKEND_DIR.parent
 
 
 def _default_database_url() -> str:
@@ -23,7 +24,8 @@ def _default_database_url() -> str:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(BASE_DIR / ".env"),
+        # Prefer backend/.env (later file wins); root .env still works as fallback
+        env_file=(str(BASE_DIR / ".env"), str(BACKEND_DIR / ".env")),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -36,12 +38,18 @@ class Settings(BaseSettings):
     graph_scopes: str = "Mail.Read,Mail.Send,User.Read"
 
     # Database (override in Azure: sqlite:////home/data/crm.db)
+    # WARNING: SQLite + multiple App Service instances = split-brain / lost writes.
+    # Keep API scale-out at 1 instance until migrated to Postgres.
     database_url: str = Field(default_factory=_default_database_url)
 
     # App
     frontend_url: str = "http://localhost:3000"
     cors_origins: str = ""
     secret_key: str = "change-me-in-production"
+
+    # Treat a sync as hung if still "running" longer than this (hours).
+    # Startup cleanup handles restarts; this covers wedged in-process jobs.
+    sync_stale_hours: float = 6.0
 
     # Anthropic (MVP 4 — on-demand AI)
     anthropic_api_key: str = ""

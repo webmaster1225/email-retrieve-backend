@@ -115,7 +115,7 @@ async def generate_draft_for_contact(
     context = build_metadata_context(contact, messages)
     user_prompt = build_user_prompt(prompt_row.user_prompt_template, context, custom_instructions)
 
-    raw = _call_anthropic(prompt_row.system_prompt, user_prompt)
+    raw = await _call_anthropic(prompt_row.system_prompt, user_prompt)
     subject, body = _parse_draft_response(raw)
 
     existing = (

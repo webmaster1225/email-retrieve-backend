@@ -1,0 +1,9 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env & secrets
+.venv/
+.env
+.env.*

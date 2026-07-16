@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 
@@ -369,7 +370,7 @@ async def analyze_contact_intelligence(
         target_block=_target_block(target_use_case),
     )
     try:
-        raw = _call_anthropic(ANALYSIS_SYSTEM, user_prompt)
+        raw = await _call_anthropic(ANALYSIS_SYSTEM, user_prompt)
     except AIServiceError as exc:
         raise OutreachIntelligenceError(str(exc)) from exc
 
@@ -521,7 +522,7 @@ async def generate_personalized_draft(
     system_prompt = PERSONALIZED_DRAFT_SYSTEM
 
     try:
-        raw = _call_anthropic(system_prompt, user_prompt)
+        raw = await _call_anthropic(system_prompt, user_prompt)
     except AIServiceError as exc:
         raise OutreachIntelligenceError(str(exc)) from exc
 
@@ -659,6 +660,8 @@ async def run_batch_job(job_id: str) -> None:
             job.results = results
             job.updated_at = datetime.utcnow()
             db.commit()
+            # Yield so contacts/sync endpoints stay responsive during long batches
+            await asyncio.sleep(0)
 
         job.status = "completed"
         job.completed_at = datetime.utcnow()

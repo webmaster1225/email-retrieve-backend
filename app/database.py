@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Generator
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine, event
@@ -8,17 +11,22 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import BASE_DIR, get_settings
 
+logger = logging.getLogger(__name__)
+
 settings = get_settings()
 data_dir = BASE_DIR / "data"
 data_dir.mkdir(parents=True, exist_ok=True)
 
-if settings.database_url.startswith("sqlite"):
+_IS_SQLITE = settings.database_url.startswith("sqlite")
+_ON_AZURE = bool(os.getenv("WEBSITE_SITE_NAME"))
+
+if _IS_SQLITE:
     # Ensure the SQLite file's parent directory exists (e.g. /home/data on Azure)
     db_path = settings.database_url.split("sqlite:///", 1)[-1]
     if db_path and db_path not in (":memory:",):
         Path(db_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+connect_args = {"check_same_thread": False} if _IS_SQLITE else {}
 engine = create_engine(settings.database_url, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -27,13 +35,51 @@ class Base(DeclarativeBase):
     pass
 
 
-if settings.database_url.startswith("sqlite"):
+if _IS_SQLITE:
 
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        # Wait instead of failing immediately when another connection holds a lock
+        cursor.execute("PRAGMA busy_timeout=30000")
+        # WAL is great locally; avoid it on Azure Files (/home) where SMB locking is unreliable
+        if not _ON_AZURE:
+            cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()
+
+
+def cleanup_orphaned_jobs() -> int:
+    """Mark in-flight sync/outreach rows as failed after a process restart.
+
+    BackgroundTasks die with the worker; without this, status stays 'running'
+    forever and blocks every future sync start.
+    """
+    from app.models.outreach import OutreachJob
+    from app.models.sync import SyncRun
+
+    db = SessionLocal()
+    cleared = 0
+    try:
+        now = datetime.utcnow()
+        message = "Interrupted by process restart"
+        for run in db.query(SyncRun).filter(SyncRun.status == "running").all():
+            run.status = "failed"
+            run.error_message = message
+            run.completed_at = now
+            cleared += 1
+        for job in db.query(OutreachJob).filter(OutreachJob.status == "running").all():
+            job.status = "failed"
+            job.error_message = message
+            job.completed_at = now
+            job.updated_at = now
+            cleared += 1
+        if cleared:
+            db.commit()
+            logger.warning("Cleared %s orphaned running job(s) after startup", cleared)
+        return cleared
+    finally:
+        db.close()
 
 
 def _assign_contact_list_numbers(conn) -> None:
@@ -124,6 +170,31 @@ def run_migrations() -> None:
                 conn.execute(text("ALTER TABLE contacts ADD COLUMN outreach_relevance_tier VARCHAR(16)"))
             if "outreach_score_explanation" not in columns:
                 conn.execute(text("ALTER TABLE contacts ADD COLUMN outreach_score_explanation TEXT"))
+            if "last_subject" not in columns:
+                conn.execute(text("ALTER TABLE contacts ADD COLUMN last_subject TEXT"))
+            if "last_preview" not in columns:
+                conn.execute(text("ALTER TABLE contacts ADD COLUMN last_preview TEXT"))
+            if "latest_outlook_weblink" not in columns:
+                conn.execute(text("ALTER TABLE contacts ADD COLUMN latest_outlook_weblink TEXT"))
+
+    # Speed indexes for the default contacts list scan
+    if "contacts" in inspector.get_table_names():
+        existing_indexes = {idx["name"] for idx in inspector.get_indexes("contacts")}
+        with engine.begin() as conn:
+            if "ix_contacts_list_default" not in existing_indexes:
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_contacts_list_default "
+                        "ON contacts (is_internal, is_excluded, last_contacted_at)"
+                    )
+                )
+            if "ix_contacts_review_list" not in existing_indexes:
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_contacts_review_list "
+                        "ON contacts (is_internal, is_excluded, review_status, last_contacted_at)"
+                    )
+                )
 
 
 def init_db() -> None:
@@ -131,6 +202,8 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     run_migrations()
+    logger.info("Database ready (%s)", settings.database_url.split("://", 1)[0])
+    cleanup_orphaned_jobs()
 
 
 def get_db() -> Generator[Session, None, None]:

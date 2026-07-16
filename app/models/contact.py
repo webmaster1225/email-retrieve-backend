@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Index, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -16,6 +16,15 @@ def _uuid() -> str:
 
 class Contact(Base):
     __tablename__ = "contacts"
+    __table_args__ = (
+        Index(
+            "ix_contacts_list_default",
+            "is_internal",
+            "is_excluded",
+            "last_contacted_at",
+        ),
+        Index("ix_contacts_review_list", "is_internal", "is_excluded", "review_status", "last_contacted_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     full_name: Mapped[str | None] = mapped_column(String(512))
@@ -48,6 +57,10 @@ class Contact(Base):
     outreach_relevance_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     outreach_relevance_tier: Mapped[str | None] = mapped_column(String(16))
     outreach_score_explanation: Mapped[str | None] = mapped_column(Text)
+    # Denormalized from latest outbound message for fast list rendering
+    last_subject: Mapped[str | None] = mapped_column(Text)
+    last_preview: Mapped[str | None] = mapped_column(Text)
+    latest_outlook_weblink: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

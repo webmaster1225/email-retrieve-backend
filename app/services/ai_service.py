@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime
 from html import unescape
@@ -128,7 +129,7 @@ async def build_full_context(db: Session, contact_id: str) -> str:
     return base
 
 
-def _call_anthropic(system: str, user_prompt: str) -> str:
+def _call_anthropic_sync(system: str, user_prompt: str) -> str:
     settings = get_settings()
     client = _get_client()
     fallbacks = [
@@ -158,6 +159,11 @@ def _call_anthropic(system: str, user_prompt: str) -> str:
     raise AIServiceError(f"Anthropic API failed for all models: {last_error}")
 
 
+async def _call_anthropic(system: str, user_prompt: str) -> str:
+    """Run the sync Anthropic client off the event loop so HTTP stays responsive."""
+    return await asyncio.to_thread(_call_anthropic_sync, system, user_prompt)
+
+
 def _ensure_context_row(db: Session, contact: Contact) -> ContactContext:
     if contact.context:
         return contact.context
@@ -176,7 +182,7 @@ async def generate_summary(db: Session, contact_id: str, *, force: bool = False)
 
     messages = _contact_messages(db, contact_id)
     prompt_context = build_metadata_context(contact, messages)
-    summary = _call_anthropic(
+    summary = await _call_anthropic(
         "You are a relationship intelligence assistant for Edge Investing / Galaxy Pharma fundraising and business development.",
         f"""Based on sent email metadata below, write a concise relationship summary covering:
 - Who is this person and what company are they associated with?
@@ -209,7 +215,7 @@ async def generate_follow_up(db: Session, contact_id: str, *, force: bool = Fals
     if ctx.ai_summary:
         prompt_context += f"\n\nExisting AI summary:\n{ctx.ai_summary}"
 
-    draft = _call_anthropic(
+    draft = await _call_anthropic(
         "You write professional, warm follow-up emails for Edge Investing / Galaxy Pharma.",
         f"""Draft a short follow-up email to this contact based on the relationship history below.
 - Professional but personable tone
@@ -239,7 +245,7 @@ async def classify_contact(db: Session, contact_id: str, *, force: bool = False)
 
     messages = _contact_messages(db, contact_id)
     prompt_context = build_metadata_context(contact, messages)
-    raw = _call_anthropic(
+    raw = await _call_anthropic(
         "You classify business contacts for a healthcare investment firm.",
         f"""Classify this contact. Reply in this exact JSON format only (no markdown):
 {{"contact_type": "investor|family_office|pharma|healthcare|advisor|vendor|legal|board|intro|other", "confidence": "high|medium|low", "reason": "one sentence"}}
@@ -273,7 +279,7 @@ async def summarize_threads(db: Session, contact_id: str, *, force: bool = False
             return {"summary": ctx.ai_summary, "cached": True, "generated_at": ctx.ai_summary_generated_at}
 
     full_context = await build_full_context(db, contact_id)
-    summary = _call_anthropic(
+    summary = await _call_anthropic(
         "You summarize email thread history for fundraising and BD relationship management.",
         f"""Provide a detailed thread-by-thread summary of the relationship with this contact.
 Include:
@@ -337,8 +343,8 @@ def _build_outlook_context(
     return "\n".join(lines)
 
 
-def _infer_seniority(prompt_context: str) -> dict:
-    raw = _call_anthropic(
+async def _infer_seniority(prompt_context: str) -> dict:
+    raw = await _call_anthropic(
         "You infer job titles and seniority from business email metadata for fundraising relationship management.",
         f"""Infer this contact's likely job title and seniority from the information below.
 Look for signals in their name, email signature patterns, subject lines, email previews, and company context.
@@ -363,7 +369,7 @@ async def detect_seniority(db: Session, contact_id: str, *, force: bool = False)
 
     messages = _contact_messages(db, contact_id)
     prompt_context = build_metadata_context(contact, messages)
-    seniority = _infer_seniority(prompt_context)
+    seniority = await _infer_seniority(prompt_context)
     ctx.ai_seniority = seniority
     if seniority.get("title"):
         ctx.detected_role = seniority["title"]
@@ -400,7 +406,7 @@ async def detect_seniority_for_outlook(
         last_subject=last_subject,
         last_preview=last_preview,
     )
-    seniority = _infer_seniority(prompt_context)
+    seniority = await _infer_seniority(prompt_context)
     return {"seniority": seniority, "cached": False, "generated_at": None}
 
 
@@ -446,8 +452,8 @@ def _parse_relationship_json(raw: str) -> dict:
     return data
 
 
-def _infer_relationship(prompt_context: str) -> dict:
-    raw = _call_anthropic(
+async def _infer_relationship(prompt_context: str) -> dict:
+    raw = await _call_anthropic(
         "You analyze email relationship patterns for Edge Investing / Galaxy Pharma business development.",
         f"""Analyze the email exchange history below and assess the relationship.
 
@@ -506,7 +512,7 @@ async def analyze_relationship(db: Session, contact_id: str, *, force: bool = Fa
         stats=stats,
         messages=messages,
     )
-    analysis = _infer_relationship(prompt_context)
+    analysis = await _infer_relationship(prompt_context)
     generated_at = datetime.utcnow().isoformat()
     payload = {"generated_at": generated_at, "stats": stats, "analysis": analysis}
     ctx.ai_relationship_analysis = payload
@@ -560,7 +566,7 @@ async def analyze_relationship_for_outlook(
         stats=stats,
         messages=messages,
     )
-    analysis = _infer_relationship(prompt_context)
+    analysis = await _infer_relationship(prompt_context)
     return {
         "stats": stats,
         "analysis": analysis,
