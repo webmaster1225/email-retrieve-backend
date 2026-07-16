@@ -18,7 +18,7 @@ from app.services.graph_client import GraphClient
 from app.services.text_utils import normalize_email, normalize_subject, parse_display_name
 
 # Graph allows up to 999; 100 balances throughput vs payload size
-GRAPH_PAGE_SIZE = 100
+GRAPH_PAGE_SIZE = 200
 _YIELD_EVERY_N_MESSAGES = 50
 
 
