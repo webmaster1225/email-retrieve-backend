@@ -24,6 +24,30 @@ REVIEW_STATUSES = {"pending", "approved", "denied"}
 _HAS_TEST_SEED: bool | None = None
 
 
+def _source_account_match(account_id: str):
+    """Match EmailMessage.source_account, treating legacy null/empty as edge."""
+    if account_id == "edge":
+        return or_(
+            EmailMessage.source_account == "edge",
+            EmailMessage.source_account.is_(None),
+            EmailMessage.source_account == "",
+        )
+    return EmailMessage.source_account == account_id
+
+
+def _contact_has_account_messages(db: Session, account_id: str):
+    """EXISTS clause: contact linked to ≥1 message from this mailbox."""
+    return (
+        db.query(ContactEmailLink.id)
+        .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
+        .filter(
+            ContactEmailLink.contact_id == Contact.id,
+            _source_account_match(account_id),
+        )
+        .exists()
+    )
+
+
 def _has_test_seed_messages(db: Session) -> bool:
     global _HAS_TEST_SEED
     if _HAS_TEST_SEED is not None:
@@ -245,6 +269,7 @@ def _list_outlook_from_local(
     q: str | None,
     exclude_emails: set[str],
     offset: int,
+    account_id: str | None = None,
 ) -> dict:
     query = (
         db.query(Contact)
@@ -257,6 +282,8 @@ def _list_outlook_from_local(
         )
         .filter(Contact.is_internal.is_(False), Contact.is_excluded.is_(False))
     )
+    if account_id:
+        query = query.filter(_contact_has_account_messages(db, account_id))
     if exclude_emails:
         query = query.filter(~Contact.primary_email.in_(exclude_emails))
     if q:
@@ -507,6 +534,7 @@ def list_contacts(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
     include_total: bool = Query(True),
+    account_id: str | None = Query(None, description="Filter contacts linked to this mailbox"),
 ):
     context_load = (
         joinedload(Contact.context)
@@ -520,6 +548,9 @@ def list_contacts(
     query = db.query(Contact).options(context_load)
     if keyword:
         query = query.outerjoin(ContactContext, ContactContext.contact_id == Contact.id)
+
+    if account_id:
+        query = query.filter(_contact_has_account_messages(db, account_id))
 
     if exclude_noise:
         query = query.filter(Contact.is_excluded.is_(False))
@@ -614,9 +645,13 @@ def list_contacts(
 async def contact_stats(
     db: Session = Depends(get_db),
     include_graph_total: bool = False,
+    account_id: str | None = Query(None, description="Scope stats to one mailbox"),
 ):
     external = and_(Contact.is_internal.is_(False), Contact.is_excluded.is_(False))
-    counts = db.query(
+    contact_q = db.query(Contact)
+    if account_id:
+        contact_q = contact_q.filter(_contact_has_account_messages(db, account_id))
+    counts = contact_q.with_entities(
         func.count(Contact.id),
         func.sum(case((external, 1), else_=0)),
         func.sum(case((Contact.fundraising_relevance_tier == "high", 1), else_=0)),
@@ -631,7 +666,10 @@ async def contact_stats(
     review_approved = int(counts[4] or 0)
     review_denied = int(counts[5] or 0)
 
-    msg_counts = db.query(
+    msg_q = db.query(EmailMessage)
+    if account_id:
+        msg_q = msg_q.filter(_source_account_match(account_id))
+    msg_counts = msg_q.with_entities(
         func.count(EmailMessage.id),
         func.sum(case((~EmailMessage.graph_message_id.like("test-%"), 1), else_=0)),
     ).one()
@@ -642,16 +680,19 @@ async def contact_stats(
     sync_complete: bool | None = None
     # The live Graph call is slow; only make it when explicitly requested
     # (e.g. while polling sync progress). Regular page loads stay fast.
-    if include_graph_total:
+    if include_graph_total and (not account_id or account_id == "edge"):
         try:
-            folder = await GraphClient(db).fetch_sent_items_folder()
+            folder = await GraphClient(db, account_id=account_id or "edge").fetch_sent_items_folder()
             graph_sent_total = folder.get("totalItemCount")
             if graph_sent_total is not None:
                 sync_complete = synced_messages >= graph_sent_total
         except (GraphAuthError, httpx.HTTPError):
             pass
 
-    last_sync = db.query(SyncRun).filter(SyncRun.status == "completed").order_by(SyncRun.completed_at.desc()).first()
+    sync_q = db.query(SyncRun).filter(SyncRun.status == "completed")
+    if account_id:
+        sync_q = sync_q.filter(SyncRun.account_id == account_id)
+    last_sync = sync_q.order_by(SyncRun.completed_at.desc()).first()
     return StatsOut(
         total_contacts=total_contacts,
         external_contacts=external_contacts,

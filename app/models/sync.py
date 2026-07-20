@@ -17,6 +17,7 @@ class AuthToken(Base):
     __tablename__ = "auth_tokens"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    account_id: Mapped[str | None] = mapped_column(String(32), index=True)
     user_email: Mapped[str | None] = mapped_column(String(320))
     user_id: Mapped[str | None] = mapped_column(String(128))
     access_token: Mapped[str] = mapped_column(Text)
@@ -30,6 +31,7 @@ class SyncRun(Base):
     __tablename__ = "sync_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    account_id: Mapped[str | None] = mapped_column(String(32), index=True, default="edge")
     sync_type: Mapped[str] = mapped_column(String(16), default="full")
     status: Mapped[str] = mapped_column(String(16), default="running", index=True)
     messages_fetched: Mapped[int] = mapped_column(Integer, default=0)

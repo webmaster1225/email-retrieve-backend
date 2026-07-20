@@ -35,6 +35,7 @@ class EmailMessage(Base):
     raw_cc: Mapped[list] = mapped_column(JSON, default=list)
     raw_bcc: Mapped[list] = mapped_column(JSON, default=list)
     direction: Mapped[str] = mapped_column(String(16), default="outbound", index=True)
+    source_account: Mapped[str] = mapped_column(String(32), default="edge", index=True)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

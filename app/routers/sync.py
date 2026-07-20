@@ -33,13 +33,13 @@ def reprocess_contacts(background_tasks: BackgroundTasks):
 
 @router.post("/start-inbox", response_model=SyncRunOut)
 def start_inbox_sync(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    client = GraphClient(db)
+    client = GraphClient(db, account_id="edge")
     try:
         client.ensure_access_token()
     except GraphAuthError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-    service = SyncService(db)
+    service = SyncService(db, account_id="edge")
     active = service.get_active_run()
     if active:
         return active
@@ -51,13 +51,13 @@ def start_inbox_sync(background_tasks: BackgroundTasks, db: Session = Depends(ge
 
 @router.post("/start", response_model=SyncRunOut)
 def start_sync(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    client = GraphClient(db)
+    client = GraphClient(db, account_id="edge")
     try:
         client.ensure_access_token()
     except GraphAuthError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-    service = SyncService(db)
+    service = SyncService(db, account_id="edge")
     active = service.get_active_run()
     if active:
         return active

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -20,6 +21,8 @@ from app.services.text_utils import normalize_email, normalize_subject, parse_di
 # Graph allows up to 999; 100 balances throughput vs payload size
 GRAPH_PAGE_SIZE = 100
 _YIELD_EVERY_N_MESSAGES = 50
+# Small overlap so messages sent during a prior sync are not missed
+_SYNC_WATERMARK_BUFFER = timedelta(minutes=1)
 
 
 def _serialize_recipients(recipients: list[dict] | None) -> list[dict]:
@@ -36,14 +39,31 @@ def upsert_message(
     item: dict,
     *,
     direction: str = "outbound",
+    source_account: str = "edge",
     existing_by_graph_id: dict[str, EmailMessage] | None = None,
 ) -> tuple[EmailMessage, bool]:
     graph_id = item["id"]
     if existing_by_graph_id is not None:
         existing = existing_by_graph_id.get(graph_id)
     else:
-        existing = db.query(EmailMessage).filter(EmailMessage.graph_message_id == graph_id).one_or_none()
+        existing = (
+            db.query(EmailMessage)
+            .filter(
+                EmailMessage.graph_message_id == graph_id,
+                EmailMessage.source_account == source_account,
+            )
+            .one_or_none()
+        )
+        if existing is None and source_account == "edge":
+            # Pre-P2 rows may lack source_account filter match if column was null
+            existing = (
+                db.query(EmailMessage)
+                .filter(EmailMessage.graph_message_id == graph_id)
+                .one_or_none()
+            )
     if existing:
+        if not existing.source_account:
+            existing.source_account = source_account
         return existing, False
 
     sender = item.get("sender") or item.get("from") or {}
@@ -73,6 +93,7 @@ def upsert_message(
         raw_cc=_serialize_recipients(item.get("ccRecipients")),
         raw_bcc=_serialize_recipients(item.get("bccRecipients")),
         direction=direction,
+        source_account=source_account,
     )
     db.add(message)
     db.flush()
@@ -93,9 +114,10 @@ class SyncService:
     # Rebuild less often; aggregates are now batched so larger windows are fine
     BATCH_AGGREGATE_SIZE = 1000
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, account_id: str = "edge"):
         self.db = db
-        self.graph = GraphClient(db)
+        self.account_id = account_id
+        self.graph = GraphClient(db, account_id=account_id)
         self._contact_cache: dict[str, Contact] = {}
 
     def fail_running_syncs(self, reason: str = "Manually cleared stuck sync") -> list[SyncRun]:
@@ -135,10 +157,43 @@ class SyncService:
         self._fail_stale_running()
         return (
             self.db.query(SyncRun)
-            .filter(SyncRun.status == "running")
+            .filter(SyncRun.status == "running", SyncRun.account_id == self.account_id)
             .order_by(SyncRun.started_at.desc())
             .first()
         )
+
+    def _outbound_watermark(self) -> datetime | None:
+        q = self.db.query(func.max(EmailMessage.sent_datetime)).filter(
+            EmailMessage.direction == "outbound",
+            EmailMessage.source_account == self.account_id,
+        )
+        watermark = q.scalar()
+        if watermark is None and self.account_id == "edge":
+            watermark = (
+                self.db.query(func.max(EmailMessage.sent_datetime))
+                .filter(EmailMessage.direction == "outbound")
+                .scalar()
+            )
+        return watermark
+
+    def _inbound_watermark(self) -> datetime | None:
+        q = self.db.query(func.max(EmailMessage.sent_datetime)).filter(
+            EmailMessage.direction == "inbound",
+            EmailMessage.source_account == self.account_id,
+        )
+        watermark = q.scalar()
+        if watermark is None and self.account_id == "edge":
+            watermark = (
+                self.db.query(func.max(EmailMessage.sent_datetime))
+                .filter(EmailMessage.direction == "inbound")
+                .scalar()
+            )
+        return watermark
+
+    def _since_filter(self, watermark: datetime | None) -> datetime | None:
+        if watermark is None:
+            return None
+        return watermark - _SYNC_WATERMARK_BUFFER
 
     async def _process_outbound_page(
         self,
@@ -151,7 +206,10 @@ class SyncService:
         batch_touched: list[str] = []
         for index, item in enumerate(values):
             message, is_new = upsert_message(
-                self.db, item, existing_by_graph_id=existing
+                self.db,
+                item,
+                source_account=self.account_id,
+                existing_by_graph_id=existing,
             )
             messages_fetched += 1
             if is_new:
@@ -175,7 +233,11 @@ class SyncService:
         batch_touched: list[str] = []
         for index, item in enumerate(values):
             message, is_new = upsert_message(
-                self.db, item, direction="inbound", existing_by_graph_id=existing
+                self.db,
+                item,
+                direction="inbound",
+                source_account=self.account_id,
+                existing_by_graph_id=existing,
             )
             messages_fetched += 1
             if is_new:
@@ -194,6 +256,7 @@ class SyncService:
         url = sync_run.checkpoint_url
         messages_new = sync_run.messages_new
         messages_fetched = sync_run.messages_fetched
+        since = self._since_filter(self._outbound_watermark()) if url is None else None
         # Prefetch the next Graph page while we process the current one
         next_page_task: asyncio.Task | None = None
 
@@ -204,14 +267,22 @@ class SyncService:
                     next_page_task = None
                 else:
                     page = await self.graph.fetch_messages_page(
-                        url, top=GRAPH_PAGE_SIZE, newest_first=False
+                        url,
+                        top=GRAPH_PAGE_SIZE,
+                        newest_first=since is None,
+                        since=since,
                     )
 
                 values = page.get("value", [])
                 next_url = page.get("@odata.nextLink")
                 if next_url:
                     next_page_task = asyncio.create_task(
-                        self.graph.fetch_messages_page(next_url, top=GRAPH_PAGE_SIZE, newest_first=False)
+                        self.graph.fetch_messages_page(
+                            next_url,
+                            top=GRAPH_PAGE_SIZE,
+                            newest_first=since is None,
+                            since=since,
+                        )
                     )
 
                 messages_fetched, messages_new, batch_touched = await self._process_outbound_page(
@@ -245,6 +316,7 @@ class SyncService:
             sync_run.completed_at = datetime.utcnow()
             sync_run.contacts_updated = updated_count
             self.db.commit()
+            self._mark_account_synced()
         except Exception as exc:
             if next_page_task is not None:
                 next_page_task.cancel()
@@ -254,12 +326,27 @@ class SyncService:
             self.db.commit()
             raise
 
+    def _mark_account_synced(self) -> None:
+        from app.models.account import MailboxAccount
+        from app.services.connectors.graph_connector import plain_sync_label
+
+        account = self.db.get(MailboxAccount, self.account_id)
+        if not account:
+            return
+        now = datetime.utcnow()
+        account.last_sync_at = now
+        account.last_sync_plain = plain_sync_label(now)
+        account.status = "connected"
+        account.updated_at = now
+        self.db.commit()
+
     async def run_inbox_sync(self, sync_run_id: str) -> None:
         sync_run = self.db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
         touched_contact_ids: set[str] = set()
         url = sync_run.checkpoint_url
         messages_new = sync_run.messages_new
         messages_fetched = sync_run.messages_fetched
+        since = self._since_filter(self._inbound_watermark()) if url is None else None
         next_page_task: asyncio.Task | None = None
 
         try:
@@ -268,12 +355,14 @@ class SyncService:
                     page = await next_page_task
                     next_page_task = None
                 else:
-                    page = await self.graph.fetch_inbox_page(url)
+                    page = await self.graph.fetch_inbox_page(url, since=since)
 
                 values = page.get("value", [])
                 next_url = page.get("@odata.nextLink")
                 if next_url:
-                    next_page_task = asyncio.create_task(self.graph.fetch_inbox_page(next_url))
+                    next_page_task = asyncio.create_task(
+                        self.graph.fetch_inbox_page(next_url, since=since)
+                    )
 
                 messages_fetched, messages_new, batch_touched = await self._process_inbound_page(
                     values,
@@ -306,6 +395,8 @@ class SyncService:
             sync_run.completed_at = datetime.utcnow()
             sync_run.contacts_updated = updated_count
             self.db.commit()
+            self._mark_account_synced()
+            self._refresh_campaign_tracking()
         except Exception as exc:
             if next_page_task is not None:
                 next_page_task.cancel()
@@ -315,11 +406,32 @@ class SyncService:
             self.db.commit()
             raise
 
+    def _refresh_campaign_tracking(self) -> None:
+        import logging
+
+        from app.models.campaign import Campaign
+        from app.services.campaign_tracking import refresh_campaign_tracking
+
+        logger = logging.getLogger(__name__)
+        if not get_settings().feature_compass_tracking:
+            return
+        campaigns = (
+            self.db.query(Campaign)
+            .filter(Campaign.status.in_(("tracking", "scheduled", "completed", "ready_to_save")))
+            .limit(20)
+            .all()
+        )
+        for c in campaigns:
+            try:
+                refresh_campaign_tracking(self.db, c.id)
+            except Exception:
+                logger.exception("Campaign tracking refresh failed for %s", c.id)
+
     def start_inbox_sync(self) -> SyncRun:
         active = self.get_active_run()
         if active:
             return active
-        sync_run = SyncRun(sync_type="inbox", status="running")
+        sync_run = SyncRun(sync_type="inbox", status="running", account_id=self.account_id)
         self.db.add(sync_run)
         self.db.commit()
         self.db.refresh(sync_run)
@@ -330,7 +442,8 @@ class SyncService:
         if active:
             return active
 
-        sync_run = SyncRun(sync_type="full", status="running")
+        sync_type = "incremental" if self._outbound_watermark() else "full"
+        sync_run = SyncRun(sync_type=sync_type, status="running", account_id=self.account_id)
         self.db.add(sync_run)
         self.db.commit()
         self.db.refresh(sync_run)
@@ -340,8 +453,9 @@ class SyncService:
 async def run_sync_in_background(db_factory, sync_run_id: str) -> None:
     db = db_factory()
     try:
-        service = SyncService(db)
         sync_run = db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
+        account_id = sync_run.account_id or "edge"
+        service = SyncService(db, account_id=account_id)
         if sync_run.sync_type == "inbox":
             await service.run_inbox_sync(sync_run_id)
         else:

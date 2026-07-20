@@ -104,6 +104,106 @@ def _assign_contact_list_numbers(conn) -> None:
         )
 
 
+def seed_mailbox_accounts() -> None:
+    """Ensure the four canonical mailbox rows exist and mirror feature flags."""
+    from app.config import get_settings
+    from app.models.account import ACCOUNT_SEEDS, MailboxAccount
+    from app.models.sync import AuthToken
+
+    settings = get_settings()
+    db = SessionLocal()
+    try:
+        # Clear any leftover stub tokens from P2 stubs-first mode
+        stub_tokens = (
+            db.query(AuthToken)
+            .filter(AuthToken.access_token.like("stub-%"))
+            .all()
+        )
+        for tok in stub_tokens:
+            acct = db.get(MailboxAccount, tok.account_id) if tok.account_id else None
+            if acct and acct.status in ("connected", "syncing"):
+                acct.status = "not_connected"
+                acct.permissions_json = {}
+                acct.is_stub = False
+            db.delete(tok)
+
+        for seed in ACCOUNT_SEEDS:
+            row = db.get(MailboxAccount, seed["id"])
+            enabled = settings.account_feature_enabled(seed["id"])
+            is_stub = False  # Real OAuth only
+
+            if row is None:
+                row = MailboxAccount(
+                    id=seed["id"],
+                    display_name=seed["display_name"],
+                    email=seed["email"],
+                    provider=seed["provider"],
+                    blurb=seed["blurb"],
+                    is_functional=seed["is_functional"],
+                    default_included=seed["default_included"],
+                    enabled=enabled,
+                    is_stub=is_stub,
+                    status="not_connected",
+                    permissions_json={},
+                )
+                db.add(row)
+            else:
+                row.display_name = seed["display_name"]
+                row.email = seed["email"]
+                row.provider = seed["provider"]
+                row.blurb = seed["blurb"]
+                row.is_functional = seed["is_functional"]
+                row.default_included = seed["default_included"]
+                row.enabled = enabled
+                row.is_stub = False
+                row.updated_at = datetime.utcnow()
+
+        # Migrate legacy AuthToken rows (no account_id) → edge
+        legacy = (
+            db.query(AuthToken)
+            .filter((AuthToken.account_id.is_(None)) | (AuthToken.account_id == ""))
+            .order_by(AuthToken.updated_at.desc())
+            .all()
+        )
+        if legacy:
+            edge = db.get(MailboxAccount, "edge")
+            keep = legacy[0]
+            keep.account_id = "edge"
+            keep.updated_at = datetime.utcnow()
+            for extra in legacy[1:]:
+                db.delete(extra)
+            if edge and edge.status == "not_connected":
+                edge.status = "connected"
+                edge.permissions_json = {
+                    "read_mail": True,
+                    "send": True,
+                    "calendar": False,
+                    "drafts": True,
+                }
+                edge.updated_at = datetime.utcnow()
+
+        # Also attach any edge token without status update
+        edge_token = (
+            db.query(AuthToken)
+            .filter(AuthToken.account_id == "edge")
+            .order_by(AuthToken.updated_at.desc())
+            .first()
+        )
+        edge = db.get(MailboxAccount, "edge")
+        if edge_token and edge and edge.status == "not_connected":
+            edge.status = "connected"
+            edge.permissions_json = {
+                "read_mail": True,
+                "send": True,
+                "calendar": False,
+                "drafts": True,
+            }
+
+        db.commit()
+    finally:
+        db.close()
+
+
 def run_migrations() -> None:
     from sqlalchemy import inspect, text
 
@@ -137,6 +237,44 @@ def run_migrations() -> None:
             if "direction" not in msg_columns:
                 conn.execute(
                     text("ALTER TABLE email_messages ADD COLUMN direction VARCHAR(16) DEFAULT 'outbound'")
+                )
+            if "source_account" not in msg_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE email_messages ADD COLUMN source_account VARCHAR(32) DEFAULT 'edge'"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_email_messages_source_account "
+                        "ON email_messages (source_account)"
+                    )
+                )
+
+    if "auth_tokens" in inspector.get_table_names():
+        tok_columns = {column["name"] for column in inspector.get_columns("auth_tokens")}
+        with engine.begin() as conn:
+            if "account_id" not in tok_columns:
+                conn.execute(text("ALTER TABLE auth_tokens ADD COLUMN account_id VARCHAR(32)"))
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_auth_tokens_account_id "
+                        "ON auth_tokens (account_id)"
+                    )
+                )
+
+    if "sync_runs" in inspector.get_table_names():
+        sync_columns = {column["name"] for column in inspector.get_columns("sync_runs")}
+        with engine.begin() as conn:
+            if "account_id" not in sync_columns:
+                conn.execute(
+                    text("ALTER TABLE sync_runs ADD COLUMN account_id VARCHAR(32) DEFAULT 'edge'")
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_sync_runs_account_id "
+                        "ON sync_runs (account_id)"
+                    )
                 )
 
     if "contact_context" in inspector.get_table_names():
@@ -177,6 +315,68 @@ def run_migrations() -> None:
             if "latest_outlook_weblink" not in columns:
                 conn.execute(text("ALTER TABLE contacts ADD COLUMN latest_outlook_weblink TEXT"))
 
+    # P6–P9 campaign columns (create_all won't ALTER existing campaigns table)
+    if "campaigns" in inspector.get_table_names():
+        camp_cols = {column["name"] for column in inspector.get_columns("campaigns")}
+        with engine.begin() as conn:
+            alters = [
+                ("research_mode", "ALTER TABLE campaigns ADD COLUMN research_mode VARCHAR(32)"),
+                ("message_strategy", "ALTER TABLE campaigns ADD COLUMN message_strategy JSON"),
+                (
+                    "external_research_status",
+                    "ALTER TABLE campaigns ADD COLUMN external_research_status VARCHAR(32)",
+                ),
+                (
+                    "external_research_progress",
+                    "ALTER TABLE campaigns ADD COLUMN external_research_progress TEXT",
+                ),
+                (
+                    "sending_account_id",
+                    "ALTER TABLE campaigns ADD COLUMN sending_account_id VARCHAR(32)",
+                ),
+                (
+                    "sending_account_confirmed_at",
+                    "ALTER TABLE campaigns ADD COLUMN sending_account_confirmed_at DATETIME",
+                ),
+                (
+                    "careers_justification",
+                    "ALTER TABLE campaigns ADD COLUMN careers_justification TEXT",
+                ),
+            ]
+            for name, sql in alters:
+                if name not in camp_cols:
+                    conn.execute(text(sql))
+
+    if "campaign_candidates" in inspector.get_table_names():
+        cand_cols = {column["name"] for column in inspector.get_columns("campaign_candidates")}
+        with engine.begin() as conn:
+            if "tracking_status" not in cand_cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE campaign_candidates ADD COLUMN tracking_status VARCHAR(32)"
+                    )
+                )
+
+    if "send_logs" in inspector.get_table_names():
+        log_cols = {column["name"] for column in inspector.get_columns("send_logs")}
+        with engine.begin() as conn:
+            for name, sql in [
+                (
+                    "conversation_id",
+                    "ALTER TABLE send_logs ADD COLUMN conversation_id VARCHAR(512)",
+                ),
+                (
+                    "internet_message_id",
+                    "ALTER TABLE send_logs ADD COLUMN internet_message_id VARCHAR(512)",
+                ),
+                (
+                    "provider_message_id",
+                    "ALTER TABLE send_logs ADD COLUMN provider_message_id VARCHAR(512)",
+                ),
+            ]:
+                if name not in log_cols:
+                    conn.execute(text(sql))
+
     # Speed indexes for the default contacts list scan
     if "contacts" in inspector.get_table_names():
         existing_indexes = {idx["name"] for idx in inspector.get_indexes("contacts")}
@@ -202,9 +402,9 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     run_migrations()
+    seed_mailbox_accounts()
     logger.info("Database ready (%s)", settings.database_url.split("://", 1)[0])
     cleanup_orphaned_jobs()
-
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()

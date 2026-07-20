@@ -74,10 +74,11 @@ class SyncRunOut(BaseModel):
     messages_fetched: int
     messages_new: int
     contacts_updated: int
-    checkpoint_url: str | None
-    error_message: str | None
+    checkpoint_url: str | None = None
+    error_message: str | None = None
     started_at: datetime
-    completed_at: datetime | None
+    completed_at: datetime | None = None
+    account_id: str | None = None
 
 
 class AuthStatus(BaseModel):

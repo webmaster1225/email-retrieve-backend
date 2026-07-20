@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 import httpx
 import msal
@@ -70,19 +71,80 @@ async def get_shared_http_client() -> httpx.AsyncClient:
 
 
 class GraphClient:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, account_id: str = "edge"):
         self.db = db
+        self.account_id = account_id
         self.settings = get_settings()
         self._msal_app: msal.ConfidentialClientApplication | None = None
+        self._client_id, self._client_secret, self._tenant_id, self._redirect_uri = (
+            self._resolve_azure_app()
+        )
+
+    def _resolve_azure_app(self) -> tuple[str, str, str, str]:
+        """Resolve OAuth *app* credentials (not the user's email password).
+
+        Users always sign in via browser redirect. .env only holds the Azure AD
+        app registration (client id/secret) already used for Edge.
+        """
+        s = self.settings
+        client_id = s.azure_client_id or ""
+        client_secret = s.azure_client_secret or ""
+
+        if self.account_id in ("galaxy", "careers"):
+            # Prefer a dedicated Galaxy-tenant app if configured.
+            # Otherwise reuse the Edge app with /common (NOT the Edge tenant GUID).
+            # Using the Edge single-tenant GUID here causes:
+            # "application has not been installed by the administrator of the tenant".
+            client_id = s.galaxy_azure_client_id or client_id
+            client_secret = s.galaxy_azure_client_secret or client_secret
+            if s.galaxy_azure_client_id and s.galaxy_azure_tenant_id:
+                tenant_id = s.galaxy_azure_tenant_id
+            else:
+                tenant_id = "common"
+            redirect = (
+                s.galaxy_azure_redirect_uri
+                or f"{s.api_public_base.rstrip('/')}/api/v1/accounts/{self.account_id}/oauth/callback"
+            )
+            return client_id, client_secret, tenant_id, redirect
+
+        redirect = s.azure_redirect_uri
+        return (
+            client_id,
+            client_secret,
+            s.azure_tenant_id or "common",
+            redirect,
+        )
+
+    def _ensure_configured(self) -> None:
+        if not self._client_id or not self._client_secret:
+            raise GraphAuthError(
+                "Microsoft app not configured. Set AZURE_CLIENT_ID and AZURE_CLIENT_SECRET "
+                "in backend/.env (Azure AD app registration — not your email password). "
+                "Connect still signs you in via the browser."
+            )
+
+    def redirect_uri_for_account_oauth(self) -> str:
+        """Callback used by /api/v1/accounts/{id}/oauth/callback."""
+        s = self.settings
+        if self.account_id in ("galaxy", "careers"):
+            return (
+                s.galaxy_azure_redirect_uri
+                or f"{s.api_public_base.rstrip('/')}/api/v1/accounts/{self.account_id}/oauth/callback"
+            )
+        # Edge Settings uses the same redirect already registered for Contacts login
+        return s.azure_redirect_uri or (
+            f"{s.api_public_base.rstrip('/')}/api/v1/auth/callback"
+        )
 
     @property
     def msal_app(self) -> msal.ConfidentialClientApplication:
+        self._ensure_configured()
         if self._msal_app is None:
             try:
                 self._msal_app = msal.ConfidentialClientApplication(
-                    self.settings.azure_client_id,
-                    authority=f"https://login.microsoftonline.com/{self.settings.azure_tenant_id}",
-                    client_credential=self.settings.azure_client_secret,
+                    self._client_id,
+                    authority=f"https://login.microsoftonline.com/{self._tenant_id}",
+                    client_credential=self._client_secret,
                     http_client=_msal_http_client(),
                 )
             except requests.exceptions.RequestException as exc:
@@ -92,18 +154,33 @@ class GraphClient:
                 ) from exc
         return self._msal_app
 
-    def get_auth_url(self, state: str | None = None) -> str:
-        return self.msal_app.get_authorization_request_url(
-            scopes=self.settings.graph_scope_list,
-            redirect_uri=self.settings.azure_redirect_uri,
-            state=state,
-        )
+    def get_auth_url(self, state: str | None = None, *, redirect_uri: str | None = None) -> str:
+        """Build Microsoft login URL — user enters email/password in the browser."""
+        kwargs = {
+            "scopes": self.settings.graph_scope_list,
+            "redirect_uri": redirect_uri or self._redirect_uri,
+            "state": state,
+            "login_hint": self._login_hint(),
+            "prompt": "select_account",
+        }
+        try:
+            return self.msal_app.get_authorization_request_url(**kwargs)
+        except (ValueError, GraphAuthError, TypeError) as exc:
+            raise GraphAuthError(str(exc)) from exc
 
-    def exchange_code(self, code: str) -> AuthToken:
+    def _login_hint(self) -> str | None:
+        hints = {
+            "edge": "dbains@edgeinvesting.ca",
+            "galaxy": "dalbir.bains@galaxypharma.net",
+            "careers": "careers@galaxypharma.net",
+        }
+        return hints.get(self.account_id)
+
+    def exchange_code(self, code: str, *, redirect_uri: str | None = None) -> AuthToken:
         result = self.msal_app.acquire_token_by_authorization_code(
             code,
             scopes=self.settings.graph_scope_list,
-            redirect_uri=self.settings.azure_redirect_uri,
+            redirect_uri=redirect_uri or self._redirect_uri,
         )
         if "error" in result:
             raise GraphAuthError(result.get("error_description") or result["error"])
@@ -112,8 +189,21 @@ class GraphClient:
     def _store_token(self, result: dict) -> AuthToken:
         expires_in = result.get("expires_in", 3600)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in) - 60)
-        existing = self.db.query(AuthToken).order_by(AuthToken.updated_at.desc()).first()
-        token_row = existing or AuthToken(access_token="")
+        existing = (
+            self.db.query(AuthToken)
+            .filter(AuthToken.account_id == self.account_id)
+            .order_by(AuthToken.updated_at.desc())
+            .first()
+        )
+        if existing is None and self.account_id == "edge":
+            existing = (
+                self.db.query(AuthToken)
+                .filter((AuthToken.account_id.is_(None)) | (AuthToken.account_id == ""))
+                .order_by(AuthToken.updated_at.desc())
+                .first()
+            )
+        token_row = existing or AuthToken(access_token="", account_id=self.account_id)
+        token_row.account_id = self.account_id
         token_row.access_token = result["access_token"]
         token_row.refresh_token = result.get("refresh_token") or token_row.refresh_token
         token_row.expires_at = expires_at
@@ -125,12 +215,24 @@ class GraphClient:
         return token_row
 
     def get_token_row(self) -> AuthToken | None:
-        return self.db.query(AuthToken).order_by(AuthToken.updated_at.desc()).first()
+        row = (
+            self.db.query(AuthToken)
+            .filter(AuthToken.account_id == self.account_id)
+            .order_by(AuthToken.updated_at.desc())
+            .first()
+        )
+        if row:
+            return row
+        if self.account_id == "edge":
+            return self.db.query(AuthToken).order_by(AuthToken.updated_at.desc()).first()
+        return None
 
     def ensure_access_token(self) -> str:
         token_row = self.get_token_row()
         if not token_row:
             raise GraphAuthError("Not authenticated. Sign in with Microsoft first.")
+        if str(token_row.access_token).startswith("stub-"):
+            raise GraphAuthError("Stub connection removed. Sign in with Microsoft again.")
 
         now = datetime.now(timezone.utc)
         expires_at = token_row.expires_at
@@ -174,7 +276,6 @@ class GraphClient:
         return response.json()
 
     async def fetch_sent_items_folder(self) -> dict:
-        """Return Sent Items folder metadata including totalItemCount from Outlook."""
         access_token = self.ensure_access_token()
         url = f"{GRAPH_BASE}/me/mailFolders/sentitems?$select=displayName,totalItemCount,unreadItemCount"
         headers = {"Authorization": f"Bearer {access_token}"}
@@ -189,14 +290,25 @@ class GraphClient:
         *,
         top: int = 100,
         newest_first: bool = True,
+        since: datetime | None = None,
     ) -> dict:
         access_token = self.ensure_access_token()
         if url is None:
-            order = "sentDateTime desc" if newest_first else "sentDateTime asc"
-            url = (
-                f"{GRAPH_BASE}/me/mailFolders/sentitems/messages"
-                f"?$select={CONTACT_MESSAGE_SELECT}&$orderby={order}&$top={top}"
-            )
+            if since is not None:
+                since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+                since_iso = since_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                filter_expr = urlencode({"$filter": f"sentDateTime ge {since_iso}"})
+                url = (
+                    f"{GRAPH_BASE}/me/mailFolders/sentitems/messages"
+                    f"?$select={CONTACT_MESSAGE_SELECT}&{filter_expr}"
+                    f"&$orderby=sentDateTime desc&$top={top}"
+                )
+            else:
+                order = "sentDateTime desc" if newest_first else "sentDateTime asc"
+                url = (
+                    f"{GRAPH_BASE}/me/mailFolders/sentitems/messages"
+                    f"?$select={CONTACT_MESSAGE_SELECT}&$orderby={order}&$top={top}"
+                )
         headers = {"Authorization": f"Bearer {access_token}"}
         client = await get_shared_http_client()
         for attempt in range(5):
@@ -209,13 +321,28 @@ class GraphClient:
             return response.json()
         raise RuntimeError("Graph API rate limit exceeded after retries")
 
-    async def fetch_inbox_page(self, url: str | None = None) -> dict:
+    async def fetch_inbox_page(
+        self,
+        url: str | None = None,
+        *,
+        since: datetime | None = None,
+    ) -> dict:
         access_token = self.ensure_access_token()
         if url is None:
-            url = (
-                f"{GRAPH_BASE}/me/mailFolders/inbox/messages"
-                f"?$select={INBOX_MESSAGE_SELECT}&$orderby=receivedDateTime asc&$top=100"
-            )
+            if since is not None:
+                since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+                since_iso = since_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                filter_expr = urlencode({"$filter": f"receivedDateTime ge {since_iso}"})
+                url = (
+                    f"{GRAPH_BASE}/me/mailFolders/inbox/messages"
+                    f"?$select={INBOX_MESSAGE_SELECT}&{filter_expr}"
+                    f"&$orderby=receivedDateTime desc&$top=100"
+                )
+            else:
+                url = (
+                    f"{GRAPH_BASE}/me/mailFolders/inbox/messages"
+                    f"?$select={INBOX_MESSAGE_SELECT}&$orderby=receivedDateTime asc&$top=100"
+                )
         headers = {"Authorization": f"Bearer {access_token}"}
         client = await get_shared_http_client()
         for attempt in range(5):
@@ -229,7 +356,6 @@ class GraphClient:
         raise RuntimeError("Graph API rate limit exceeded after retries")
 
     async def search_messages_with_participant(self, email: str, *, top: int = 50) -> list[dict]:
-        """Search all mail folders for messages involving a contact email."""
         access_token = self.ensure_access_token()
         safe_email = email.replace('"', "")
         url = (
@@ -263,24 +389,83 @@ class GraphClient:
         subject: str,
         body: str,
         content_type: str = "Text",
-    ) -> None:
+    ) -> dict:
+        """Create then send so we can capture conversation/message ids for reply matching."""
         access_token = self.ensure_access_token()
         recipient = {"emailAddress": {"address": to_email}}
         if to_name:
             recipient["emailAddress"]["name"] = to_name
         payload = {
-            "message": {
-                "subject": subject,
-                "body": {"contentType": content_type, "content": body},
-                "toRecipients": [recipient],
-            },
-            "saveToSentItems": True,
+            "subject": subject,
+            "body": {"contentType": content_type, "content": body},
+            "toRecipients": [recipient],
         }
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
-            response = await client.post(f"{GRAPH_BASE}/me/sendMail", json=payload, headers=headers)
-            if response.status_code == 403:
+            created = await client.post(
+                f"{GRAPH_BASE}/me/messages",
+                json=payload,
+                headers=headers,
+            )
+            if created.status_code == 403:
                 raise GraphAuthError(
                     "Mail.Send permission required. Reconnect Outlook after adding Mail.Send in Azure AD."
                 )
+            created.raise_for_status()
+            data = created.json()
+            msg_id = data.get("id")
+            meta = {
+                "id": msg_id,
+                "conversation_id": data.get("conversationId"),
+                "internet_message_id": data.get("internetMessageId"),
+                "web_link": data.get("webLink"),
+            }
+            if msg_id:
+                sent = await client.post(
+                    f"{GRAPH_BASE}/me/messages/{msg_id}/send",
+                    headers=headers,
+                )
+                if sent.status_code == 403:
+                    raise GraphAuthError(
+                        "Mail.Send permission required. Reconnect Outlook after adding Mail.Send in Azure AD."
+                    )
+                sent.raise_for_status()
+            return meta
+
+    async def create_draft(
+        self,
+        *,
+        to_email: str,
+        to_name: str | None,
+        subject: str,
+        body: str,
+        content_type: str = "Text",
+    ) -> dict:
+        """Create a draft in the signed-in mailbox (Gate 6)."""
+        access_token = self.ensure_access_token()
+        recipient = {"emailAddress": {"address": to_email}}
+        if to_name:
+            recipient["emailAddress"]["name"] = to_name
+        payload = {
+            "subject": subject,
+            "body": {"contentType": content_type, "content": body},
+            "toRecipients": [recipient],
+        }
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            response = await client.post(
+                f"{GRAPH_BASE}/me/messages",
+                json=payload,
+                headers=headers,
+            )
+            if response.status_code == 403:
+                raise GraphAuthError(
+                    "Permission required to create drafts. "
+                    "Reconnect Outlook after updating Azure AD permissions."
+                )
             response.raise_for_status()
+            data = response.json()
+            return {
+                "id": data.get("id"),
+                "web_link": data.get("webLink"),
+            }
