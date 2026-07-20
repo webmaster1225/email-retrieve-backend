@@ -90,12 +90,25 @@ class GmailMailboxConnector:
     async def handle_oauth_callback_async(self, code: str) -> AccountStatusView:
         token_row = self.gmail.exchange_code(code)
         profile = await self.gmail.fetch_profile(token_row.access_token)
-        token_row.user_email = (
-            profile.get("emailAddress") or profile.get("email") or "dbains@northwyn.com"
-        )
-        token_row.user_id = profile.get("id") or profile.get("email")
+        signed_in = (
+            profile.get("emailAddress") or profile.get("email") or ""
+        ).strip()
+        token_row.user_email = signed_in or None
+        token_row.user_id = profile.get("id") or signed_in or None
         token_row.account_id = self.account_id
         account = self._account()
+        expected = (account.email or "").strip().lower()
+        actual = signed_in.lower()
+        if expected and actual and expected != actual:
+            self.db.query(AuthToken).filter(AuthToken.account_id == self.account_id).delete()
+            account.status = "not_connected"
+            account.permissions_json = {}
+            account.updated_at = datetime.utcnow()
+            self.db.commit()
+            raise GmailAuthError(
+                f"Signed in as <{signed_in}>, but {account.display_name} expects <{account.email}>. "
+                "Choose the matching Google account, then try again."
+            )
         account.status = "connected"
         account.is_stub = False
         account.permissions_json = {

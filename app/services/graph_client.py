@@ -215,6 +215,7 @@ class GraphClient:
         return token_row
 
     def get_token_row(self) -> AuthToken | None:
+        """Return only this mailbox's token — never borrow another account's OAuth identity."""
         row = (
             self.db.query(AuthToken)
             .filter(AuthToken.account_id == self.account_id)
@@ -223,8 +224,14 @@ class GraphClient:
         )
         if row:
             return row
+        # Legacy Edge rows may predate account_id; only adopt unscoped tokens.
         if self.account_id == "edge":
-            return self.db.query(AuthToken).order_by(AuthToken.updated_at.desc()).first()
+            return (
+                self.db.query(AuthToken)
+                .filter((AuthToken.account_id.is_(None)) | (AuthToken.account_id == ""))
+                .order_by(AuthToken.updated_at.desc())
+                .first()
+            )
         return None
 
     def ensure_access_token(self) -> str:

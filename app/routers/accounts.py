@@ -210,9 +210,16 @@ def start_account_sync(
         except GraphAuthError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         service = SyncService(db, account_id=account_id)
+        try:
+            service.assert_token_matches_mailbox()
+        except GraphAuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         active = service.get_active_run()
         if active:
             return active
+        account = _get_account_or_404(db, account_id)
+        account.status = "syncing"
+        db.commit()
         if sync_type == "inbox":
             sync_run = service.start_inbox_sync()
         else:

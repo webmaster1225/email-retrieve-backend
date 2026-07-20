@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.models.account import MailboxAccount
 from app.models.contact import Contact
 from app.models.message import EmailMessage
 from app.models.sync import SyncRun
@@ -15,7 +16,7 @@ from app.services.contact_pipeline import (
     process_message_recipients,
     rebuild_contact_aggregates,
 )
-from app.services.graph_client import GraphClient
+from app.services.graph_client import GraphAuthError, GraphClient
 from app.services.text_utils import normalize_email, normalize_subject, parse_display_name
 
 # Graph allows up to 999; 100 balances throughput vs payload size
@@ -58,13 +59,30 @@ def upsert_message(
             # Pre-P2 rows may lack source_account filter match if column was null
             existing = (
                 db.query(EmailMessage)
-                .filter(EmailMessage.graph_message_id == graph_id)
+                .filter(
+                    EmailMessage.graph_message_id == graph_id,
+                    or_(
+                        EmailMessage.source_account.is_(None),
+                        EmailMessage.source_account == "",
+                    ),
+                )
                 .one_or_none()
             )
+
     if existing:
         if not existing.source_account:
             existing.source_account = source_account
         return existing, False
+
+    # graph_message_id is globally unique — if another mailbox already imported this
+    # Graph id, do not insert again (same Microsoft identity connected twice).
+    collision = (
+        db.query(EmailMessage)
+        .filter(EmailMessage.graph_message_id == graph_id)
+        .one_or_none()
+    )
+    if collision is not None:
+        return collision, False
 
     sender = item.get("sender") or item.get("from") or {}
     _, sender_email = parse_display_name(sender)
@@ -102,11 +120,33 @@ def upsert_message(
     return message, True
 
 
-def _existing_messages_for_page(db: Session, values: list[dict]) -> dict[str, EmailMessage]:
+def _existing_messages_for_page(
+    db: Session,
+    values: list[dict],
+    *,
+    source_account: str,
+) -> dict[str, EmailMessage]:
+    """Look up existing rows for this mailbox only.
+
+    Must be scoped by source_account — otherwise syncing mailbox B can reuse
+    mailbox A's rows (same Graph identity or shared graph ids) and every Sync
+    button appears to import the same mailbox.
+    """
     graph_ids = [item["id"] for item in values if item.get("id")]
     if not graph_ids:
         return {}
-    rows = db.query(EmailMessage).filter(EmailMessage.graph_message_id.in_(graph_ids)).all()
+    q = db.query(EmailMessage).filter(EmailMessage.graph_message_id.in_(graph_ids))
+    if source_account == "edge":
+        q = q.filter(
+            or_(
+                EmailMessage.source_account == "edge",
+                EmailMessage.source_account.is_(None),
+                EmailMessage.source_account == "",
+            )
+        )
+    else:
+        q = q.filter(EmailMessage.source_account == source_account)
+    rows = q.all()
     return {m.graph_message_id: m for m in rows}
 
 
@@ -119,6 +159,25 @@ class SyncService:
         self.account_id = account_id
         self.graph = GraphClient(db, account_id=account_id)
         self._contact_cache: dict[str, Contact] = {}
+
+    def assert_token_matches_mailbox(self) -> None:
+        """Refuse to sync if the OAuth identity is not this mailbox's address."""
+        account = self.db.get(MailboxAccount, self.account_id)
+        if not account:
+            raise GraphAuthError(f"Unknown mailbox account: {self.account_id}")
+        token = self.graph.get_token_row()
+        if not token:
+            raise GraphAuthError(
+                f"Not authenticated for {account.display_name}. Connect this mailbox in Settings first."
+            )
+        connected = normalize_email(token.user_email)
+        expected = normalize_email(account.email)
+        if connected and expected and connected != expected:
+            raise GraphAuthError(
+                f"{account.display_name} is connected as <{token.user_email}>, but this mailbox "
+                f"expects <{account.email}>. Disconnect and sign in with the correct Microsoft account, "
+                "then Sync again."
+            )
 
     def fail_running_syncs(self, reason: str = "Manually cleared stuck sync") -> list[SyncRun]:
         """Mark all running syncs as failed so a new sync can start."""
@@ -202,7 +261,9 @@ class SyncService:
         messages_fetched: int,
         messages_new: int,
     ) -> tuple[int, int, list[str]]:
-        existing = _existing_messages_for_page(self.db, values)
+        existing = _existing_messages_for_page(
+            self.db, values, source_account=self.account_id
+        )
         batch_touched: list[str] = []
         for index, item in enumerate(values):
             message, is_new = upsert_message(
@@ -229,7 +290,9 @@ class SyncService:
         messages_fetched: int,
         messages_new: int,
     ) -> tuple[int, int, list[str]]:
-        existing = _existing_messages_for_page(self.db, values)
+        existing = _existing_messages_for_page(
+            self.db, values, source_account=self.account_id
+        )
         batch_touched: list[str] = []
         for index, item in enumerate(values):
             message, is_new = upsert_message(

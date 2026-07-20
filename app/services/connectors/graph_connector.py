@@ -125,10 +125,24 @@ class GraphMailboxConnector:
         redirect = self.graph.redirect_uri_for_account_oauth()
         token_row = self.graph.exchange_code(code, redirect_uri=redirect)
         profile = await self.graph.fetch_profile(token_row.access_token)
-        token_row.user_email = profile.get("mail") or profile.get("userPrincipalName")
+        signed_in = (profile.get("mail") or profile.get("userPrincipalName") or "").strip()
+        token_row.user_email = signed_in or None
         token_row.user_id = profile.get("id")
         token_row.account_id = self.account_id
         account = self._account()
+        expected = (account.email or "").strip().lower()
+        actual = signed_in.lower()
+        if expected and actual and expected != actual:
+            # Do not leave a mismatched token attached to this mailbox slot.
+            self.db.query(AuthToken).filter(AuthToken.account_id == self.account_id).delete()
+            account.status = "not_connected"
+            account.permissions_json = {}
+            account.updated_at = datetime.utcnow()
+            self.db.commit()
+            raise GraphAuthError(
+                f"Signed in as <{signed_in}>, but {account.display_name} expects <{account.email}>. "
+                "Choose the matching Microsoft account on the sign-in screen, then try again."
+            )
         account.status = "connected"
         account.is_stub = False
         scopes = parse_token_scopes(token_row.access_token)
