@@ -13,6 +13,15 @@ from app.config import get_settings
 from app.models.sync import AuthToken
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _graph_iso(dt: datetime) -> str:
+    """Render a datetime as a UTC ISO-8601 string Graph's $filter accepts."""
+    dt_utc = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+
 MESSAGE_SELECT = (
     "id,subject,sentDateTime,toRecipients,ccRecipients,bccRecipients,"
     "bodyPreview,conversationId,internetMessageId,webLink,hasAttachments,"
@@ -298,13 +307,17 @@ class GraphClient:
         top: int = 100,
         newest_first: bool = True,
         since: datetime | None = None,
+        before: datetime | None = None,
     ) -> dict:
         access_token = self.ensure_access_token()
         if url is None:
+            clauses: list[str] = []
             if since is not None:
-                since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
-                since_iso = since_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-                filter_expr = urlencode({"$filter": f"sentDateTime ge {since_iso}"})
+                clauses.append(f"sentDateTime ge {_graph_iso(since)}")
+            if before is not None:
+                clauses.append(f"sentDateTime lt {_graph_iso(before)}")
+            if clauses:
+                filter_expr = urlencode({"$filter": " and ".join(clauses)})
                 url = (
                     f"{GRAPH_BASE}/me/mailFolders/sentitems/messages"
                     f"?$select={CONTACT_MESSAGE_SELECT}&{filter_expr}"
@@ -337,8 +350,7 @@ class GraphClient:
         access_token = self.ensure_access_token()
         if url is None:
             if since is not None:
-                since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
-                since_iso = since_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                since_iso = _graph_iso(since)
                 filter_expr = urlencode({"$filter": f"receivedDateTime ge {since_iso}"})
                 url = (
                     f"{GRAPH_BASE}/me/mailFolders/inbox/messages"

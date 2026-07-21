@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 
+import httpx
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -279,6 +280,54 @@ class SyncService:
             return None
         return watermark - _SYNC_WATERMARK_BUFFER
 
+    def _outbound_oldest(self) -> datetime | None:
+        """Oldest outbound message we've imported for this mailbox."""
+        q = self.db.query(func.min(EmailMessage.sent_datetime)).filter(
+            EmailMessage.direction == "outbound",
+            EmailMessage.source_account == self.account_id,
+        )
+        oldest = q.scalar()
+        if oldest is None and self.account_id == "edge":
+            oldest = (
+                self.db.query(func.min(EmailMessage.sent_datetime))
+                .filter(EmailMessage.direction == "outbound")
+                .scalar()
+            )
+        return oldest
+
+    def _synced_outbound_count(self) -> int:
+        """Count of real (non-test) outbound messages imported for this mailbox."""
+        q = self.db.query(func.count(EmailMessage.id)).filter(
+            EmailMessage.direction == "outbound",
+            ~EmailMessage.graph_message_id.like("test-%"),
+        )
+        if self.account_id == "edge":
+            q = q.filter(
+                or_(
+                    EmailMessage.source_account == "edge",
+                    EmailMessage.source_account.is_(None),
+                    EmailMessage.source_account == "",
+                )
+            )
+        else:
+            q = q.filter(EmailMessage.source_account == self.account_id)
+        return int(q.scalar() or 0)
+
+    async def _needs_outbound_backfill(self) -> bool:
+        """True when the Sent folder holds more messages than we've imported.
+
+        Used after the newest-first pass to decide whether we must also walk
+        backwards and import messages older than the last sync.
+        """
+        try:
+            folder = await self.graph.fetch_sent_items_folder()
+        except (GraphAuthError, httpx.HTTPError):
+            return False
+        total = folder.get("totalItemCount")
+        if total is None:
+            return False
+        return self._synced_outbound_count() < int(total)
+
     async def _process_outbound_page(
         self,
         values: list[dict],
@@ -338,42 +387,51 @@ class SyncService:
                 await asyncio.sleep(0)
         return messages_fetched, messages_new, batch_touched
 
-    async def run_full_sync(self, sync_run_id: str) -> None:
-        sync_run = self.db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
-        touched_contact_ids: set[str] = set()
-        url = sync_run.checkpoint_url
-        messages_new = sync_run.messages_new
-        messages_fetched = sync_run.messages_fetched
-        since = self._since_filter(self._outbound_watermark()) if url is None else None
-        # Prefetch the next Graph page while we process the current one
-        next_page_task: asyncio.Task | None = None
+    async def _drain_outbound_pages(
+        self,
+        sync_run: SyncRun,
+        *,
+        since: datetime | None,
+        before: datetime | None,
+        messages_fetched: int,
+        messages_new: int,
+        touched_contact_ids: set[str],
+        resume_url: str | None = None,
+    ) -> tuple[int, int, bool]:
+        """Fetch and process Sent-items pages until exhausted or cancelled.
 
+        Returns (messages_fetched, messages_new, completed); completed is False
+        when the run was cancelled before all pages were drained.
+        """
+        url = resume_url
+        first = url is None
+        # Prefetch the next Graph page while we process the current one.
+        next_page_task: asyncio.Task | None = None
         try:
             while True:
                 if self._was_cancelled(sync_run):
-                    return
+                    return messages_fetched, messages_new, False
 
                 if next_page_task is not None:
                     page = await next_page_task
                     next_page_task = None
-                else:
+                elif first:
                     page = await self.graph.fetch_messages_page(
-                        url,
+                        None,
                         top=GRAPH_PAGE_SIZE,
-                        newest_first=since is None,
+                        newest_first=since is None and before is None,
                         since=since,
+                        before=before,
                     )
+                    first = False
+                else:
+                    page = await self.graph.fetch_messages_page(url, top=GRAPH_PAGE_SIZE)
 
                 values = page.get("value", [])
                 next_url = page.get("@odata.nextLink")
                 if next_url:
                     next_page_task = asyncio.create_task(
-                        self.graph.fetch_messages_page(
-                            next_url,
-                            top=GRAPH_PAGE_SIZE,
-                            newest_first=since is None,
-                            since=since,
-                        )
+                        self.graph.fetch_messages_page(next_url, top=GRAPH_PAGE_SIZE)
                     )
 
                 messages_fetched, messages_new, batch_touched = await self._process_outbound_page(
@@ -390,7 +448,7 @@ class SyncService:
                 if self._was_cancelled(sync_run):
                     if next_page_task is not None:
                         next_page_task.cancel()
-                    return
+                    return messages_fetched, messages_new, False
 
                 sync_run.messages_fetched = messages_fetched
                 sync_run.messages_new = messages_new
@@ -402,6 +460,50 @@ class SyncService:
                 if not next_url:
                     break
                 url = next_url
+        finally:
+            if next_page_task is not None and not next_page_task.done():
+                next_page_task.cancel()
+
+        return messages_fetched, messages_new, True
+
+    async def run_full_sync(self, sync_run_id: str) -> None:
+        sync_run = self.db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
+        touched_contact_ids: set[str] = set()
+        resume_url = sync_run.checkpoint_url
+        messages_new = sync_run.messages_new
+        messages_fetched = sync_run.messages_fetched
+        since = self._since_filter(self._outbound_watermark()) if resume_url is None else None
+
+        try:
+            # Newest-first pass: everything sent since the last sync watermark.
+            messages_fetched, messages_new, completed = await self._drain_outbound_pages(
+                sync_run,
+                since=since,
+                before=None,
+                messages_fetched=messages_fetched,
+                messages_new=messages_new,
+                touched_contact_ids=touched_contact_ids,
+                resume_url=resume_url,
+            )
+            if not completed:
+                return
+
+            # Backfill pass: if the Sent folder still holds more than we've
+            # imported (e.g. a previous sync was stopped early), walk backwards
+            # from the oldest message we have and import everything older.
+            if await self._needs_outbound_backfill():
+                before = self._outbound_oldest()
+                if before is not None:
+                    messages_fetched, messages_new, completed = await self._drain_outbound_pages(
+                        sync_run,
+                        since=None,
+                        before=before,
+                        messages_fetched=messages_fetched,
+                        messages_new=messages_new,
+                        touched_contact_ids=touched_contact_ids,
+                    )
+                    if not completed:
+                        return
 
             if self._was_cancelled(sync_run):
                 return
@@ -417,8 +519,6 @@ class SyncService:
             self.db.commit()
             self._mark_account_synced()
         except Exception as exc:
-            if next_page_task is not None:
-                next_page_task.cancel()
             if self._was_cancelled(sync_run):
                 return
             sync_run.status = "failed"
