@@ -67,7 +67,7 @@ async def callback(
     except GraphAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return RedirectResponse(f"{client.settings.frontend_url}?connected=1")
+    return RedirectResponse(f"{client.settings.frontend_url}")
 
 
 @router.get("/status", response_model=AuthStatus)

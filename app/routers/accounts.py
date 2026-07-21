@@ -172,7 +172,7 @@ async def account_oauth_callback(
             raise HTTPException(status_code=400, detail="Unsupported connector")
     except (GraphAuthError, GmailAuthError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return RedirectResponse(f"{settings.frontend_url.rstrip('/')}/settings?connected={account_id}")
+    return RedirectResponse(f"{settings.frontend_url.rstrip('/')}")
 
 
 @router.get("/{account_id}/status", response_model=AccountOut)
