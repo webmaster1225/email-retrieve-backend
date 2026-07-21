@@ -227,41 +227,37 @@ def start_account_sync(
         background_tasks.add_task(run_sync_in_background, _db_factory, sync_run.id)
         return sync_run
 
-    # Gmail: verify token and refresh last_sync (full message import later)
+    # Gmail (Northwyn): real Sent / Inbox import into EmailMessage
     if isinstance(connector, GmailMailboxConnector):
         try:
             connector.gmail.ensure_access_token()
         except GmailAuthError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
-        run = SyncRun(account_id=account_id, sync_type=sync_type, status="running")
-        db.add(run)
+        service = SyncService(db, account_id=account_id)
+        active = service.get_active_run()
+        if active:
+            return active
+        account = _get_account_or_404(db, account_id)
+        account.status = "syncing"
         db.commit()
-        db.refresh(run)
-
-        def _finish_gmail(run_id: str) -> None:
-            db2 = SessionLocal()
-            try:
-                from datetime import datetime as dt
-
-                from app.services.connectors.graph_connector import plain_sync_label
-
-                r = db2.query(SyncRun).filter(SyncRun.id == run_id).one()
-                now = dt.utcnow()
-                r.status = "completed"
-                r.completed_at = now
-                acct = db2.get(MailboxAccount, account_id)
-                if acct:
-                    acct.last_sync_at = now
-                    acct.last_sync_plain = plain_sync_label(now)
-                    acct.status = "connected"
-                db2.commit()
-            finally:
-                db2.close()
-
-        background_tasks.add_task(_finish_gmail, run.id)
-        return run
+        if sync_type == "inbox":
+            sync_run = service.start_inbox_sync()
+        else:
+            sync_run = service.start_full_sync()
+        background_tasks.add_task(run_sync_in_background, _db_factory, sync_run.id)
+        return sync_run
 
     raise HTTPException(status_code=400, detail="Sync not available for this account")
+
+
+@router.post("/{account_id}/sync/stop", response_model=SyncRunOut | None)
+def stop_account_sync(account_id: str, db: Session = Depends(get_db)):
+    """Stop this mailbox's in-progress sync."""
+    _require_accounts_ui()
+    _get_account_or_404(db, account_id)
+    service = SyncService(db, account_id=account_id)
+    stopped = service.stop_active_sync()
+    return stopped
 
 
 @router.get("/{account_id}/sync/status", response_model=SyncRunOut | None)

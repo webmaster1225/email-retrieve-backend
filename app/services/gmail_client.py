@@ -241,3 +241,116 @@ class GmailClient:
                 "conversation_id": data.get("threadId"),
                 "internet_message_id": data.get("id"),
             }
+
+    async def list_message_refs(
+        self,
+        *,
+        query: str,
+        page_token: str | None = None,
+        max_results: int = 100,
+    ) -> dict:
+        """List Gmail message IDs for a query (e.g. in:sent or in:inbox)."""
+        token = self.ensure_access_token()
+        params: dict[str, str | int] = {"q": query, "maxResults": max_results}
+        if page_token:
+            params["pageToken"] = page_token
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            response = await client.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+            if response.status_code >= 400:
+                raise GmailAuthError(f"Gmail list failed: {response.text[:200]}")
+            return response.json()
+
+    async def fetch_message(self, message_id: str, *, format: str = "full") -> dict:
+        token = self.ensure_access_token()
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            response = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"format": format},
+            )
+            if response.status_code >= 400:
+                raise GmailAuthError(f"Gmail fetch failed: {response.text[:200]}")
+            return response.json()
+
+
+def _header_map(payload: dict) -> dict[str, str]:
+    headers = payload.get("headers") or []
+    out: dict[str, str] = {}
+    for h in headers:
+        name = (h.get("name") or "").lower()
+        if name and name not in out:
+            out[name] = h.get("value") or ""
+    return out
+
+
+def _parse_address_list(raw: str | None) -> list[dict]:
+    """Parse a From/To/Cc header into Graph-shaped emailAddress dicts."""
+    if not raw:
+        return []
+    import re
+
+    results: list[dict] = []
+    # Split on commas not inside quotes
+    parts = re.split(r',(?=(?:[^"]*"[^"]*")*[^"]*$)', raw)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r'^(?:"?([^"<]*)"?\s*)?<?([^\s<>]+@[^\s<>]+)>?$', part)
+        if m:
+            name = (m.group(1) or "").strip().strip('"')
+            email = (m.group(2) or "").strip()
+            results.append({"emailAddress": {"name": name or None, "address": email}})
+        elif "@" in part:
+            results.append({"emailAddress": {"name": None, "address": part.strip("<> ")}})
+    return results
+
+
+def gmail_message_to_graph_shape(msg: dict, *, direction: str = "outbound") -> dict:
+    """Normalize a Gmail message into the Graph-like shape upsert_message expects."""
+    payload = msg.get("payload") or {}
+    headers = _header_map(payload)
+    gmail_id = msg.get("id") or ""
+    # Prefix so Gmail ids never collide with Microsoft Graph message ids
+    graph_id = f"gmail:{gmail_id}"
+    subject = headers.get("subject")
+    from_list = _parse_address_list(headers.get("from"))
+    to_list = _parse_address_list(headers.get("to"))
+    cc_list = _parse_address_list(headers.get("cc"))
+    bcc_list = _parse_address_list(headers.get("bcc"))
+    # internalDate is ms since epoch
+    internal_ms = msg.get("internalDate")
+    if internal_ms:
+        dt = datetime.fromtimestamp(int(internal_ms) / 1000.0, tz=timezone.utc)
+        iso = dt.isoformat().replace("+00:00", "Z")
+    else:
+        iso = headers.get("date") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    snippet = msg.get("snippet") or ""
+    label_ids = msg.get("labelIds") or []
+    has_parts = any(
+        isinstance(p, dict) and p.get("filename") for p in (payload.get("parts") or [])
+    )
+    return {
+        "id": graph_id,
+        "internetMessageId": headers.get("message-id"),
+        "conversationId": msg.get("threadId"),
+        "sentDateTime": iso,
+        "receivedDateTime": iso,
+        "subject": subject,
+        "bodyPreview": snippet[:500],
+        "webLink": f"https://mail.google.com/mail/u/0/#all/{gmail_id}" if gmail_id else None,
+        "hasAttachments": has_parts,
+        "importance": "high" if "IMPORTANT" in label_ids else "normal",
+        "categories": label_ids,
+        "from": from_list[0] if from_list else {},
+        "sender": from_list[0] if from_list else {},
+        "toRecipients": to_list,
+        "ccRecipients": cc_list,
+        "bccRecipients": bcc_list,
+        "_direction": direction,
+    }

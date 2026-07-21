@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
 
 import httpx
@@ -146,6 +147,54 @@ def _latest_messages_for_contacts(db: Session, contact_ids: list[str]) -> dict[s
     for contact_id, message in rows:
         result.setdefault(contact_id, message)
     return result
+
+
+def _account_scoped_aggregates(
+    db: Session, contact_ids: list[str], account_id: str
+) -> dict[str, dict]:
+    """Per-contact stats derived only from a single mailbox's messages.
+
+    Contacts are stored globally (keyed by primary_email) and their aggregate
+    columns are computed across every mailbox. When a mailbox is selected we must
+    show only that mailbox's correspondence, so recompute the list-facing metrics
+    from just this account's messages.
+    """
+    if not contact_ids:
+        return {}
+    rows = (
+        db.query(ContactEmailLink.contact_id, EmailMessage)
+        .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
+        .filter(
+            ContactEmailLink.contact_id.in_(contact_ids),
+            _source_account_match(account_id),
+        )
+        .order_by(EmailMessage.sent_datetime.asc())
+        .all()
+    )
+    messages_by_contact: dict[str, list[EmailMessage]] = defaultdict(list)
+    seen: dict[str, set[str]] = defaultdict(set)
+    for contact_id, message in rows:
+        if message.id in seen[contact_id]:
+            continue
+        seen[contact_id].add(message.id)
+        messages_by_contact[contact_id].append(message)
+
+    out: dict[str, dict] = {}
+    for contact_id, messages in messages_by_contact.items():
+        if not messages:
+            continue
+        outbound = [m for m in messages if (m.direction or "outbound") == "outbound"]
+        basis = outbound or messages
+        conversations = {m.conversation_id for m in messages if m.conversation_id}
+        latest = max(messages, key=lambda m: m.sent_datetime)
+        out[contact_id] = {
+            "email_count": len(basis),
+            "thread_count": len(conversations),
+            "first_contacted_at": basis[0].sent_datetime,
+            "last_contacted_at": basis[-1].sent_datetime,
+            "latest": latest,
+        }
+    return out
 
 
 def _parse_exclude_emails(raw: str | None) -> set[str]:
@@ -575,7 +624,20 @@ def list_contacts(
         tiers = [t.strip() for t in fundraising_tier.split(",") if t.strip()]
         query = query.filter(Contact.fundraising_relevance_tier.in_(tiers))
     if email_count_min is not None:
-        query = query.filter(Contact.email_count >= email_count_min)
+        if account_id:
+            scoped_count = (
+                db.query(func.count(func.distinct(EmailMessage.id)))
+                .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
+                .filter(
+                    ContactEmailLink.contact_id == Contact.id,
+                    _source_account_match(account_id),
+                )
+                .correlate(Contact)
+                .scalar_subquery()
+            )
+            query = query.filter(scoped_count >= email_count_min)
+        else:
+            query = query.filter(Contact.email_count >= email_count_min)
     if only_investor:
         query = query.filter(or_(Contact.contact_type == "investor", Contact.fundraising_relevance_tier == "high"))
     if review_status:
@@ -607,16 +669,34 @@ def list_contacts(
             )
         )
 
-    sort_column = {
-        "list_number": Contact.list_number,
-        "last_contacted_at": Contact.last_contacted_at,
-        "first_contacted_at": Contact.first_contacted_at,
-        "email_count": Contact.email_count,
-        "fundraising_relevance_score": Contact.fundraising_relevance_score,
-        "outreach_relevance_score": Contact.outreach_relevance_score,
-        "full_name": Contact.full_name,
-        "company_name": Contact.company_name,
-    }.get(sort, Contact.last_contacted_at)
+    # When a mailbox is selected, order by that mailbox's most recent message so
+    # the list reflects the account, not the contact's global last-contacted date.
+    account_last_dt = None
+    if account_id:
+        account_last_dt = (
+            db.query(func.max(EmailMessage.sent_datetime))
+            .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
+            .filter(
+                ContactEmailLink.contact_id == Contact.id,
+                _source_account_match(account_id),
+            )
+            .correlate(Contact)
+            .scalar_subquery()
+        )
+
+    if account_id and sort in ("last_contacted_at", "first_contacted_at"):
+        sort_column = account_last_dt
+    else:
+        sort_column = {
+            "list_number": Contact.list_number,
+            "last_contacted_at": Contact.last_contacted_at,
+            "first_contacted_at": Contact.first_contacted_at,
+            "email_count": Contact.email_count,
+            "fundraising_relevance_score": Contact.fundraising_relevance_score,
+            "outreach_relevance_score": Contact.outreach_relevance_score,
+            "full_name": Contact.full_name,
+            "company_name": Contact.company_name,
+        }.get(sort, Contact.last_contacted_at)
 
     if order == "asc":
         query = query.order_by(sort_column.asc().nullslast())
@@ -627,14 +707,39 @@ def list_contacts(
     total: int | None = query.count() if include_total else None
     contacts = query.offset((page - 1) * page_size).limit(page_size).all()
 
-    # Prefer denormalized last_* fields; only query messages for contacts missing them
-    missing_ids = [c.id for c in contacts if not getattr(c, "last_subject", None)]
-    latest_by_contact = _latest_messages_for_contacts(db, missing_ids) if missing_ids else {}
-    return {
-        "items": [
+    if account_id:
+        # Show only this mailbox's data for each contact (no cross-mailbox overlap).
+        scoped = _account_scoped_aggregates(db, [c.id for c in contacts], account_id)
+        items = []
+        for c in contacts:
+            item = _hydrate_list_item(c, resolve_from_links=False)
+            agg = scoped.get(c.id)
+            if agg:
+                latest = agg["latest"]
+                item = item.model_copy(
+                    update={
+                        "email_count": agg["email_count"],
+                        "thread_count": agg["thread_count"],
+                        "first_contacted_at": agg["first_contacted_at"],
+                        "last_contacted_at": agg["last_contacted_at"],
+                        "last_subject": latest.subject,
+                        "last_preview": latest.body_preview,
+                        "latest_outlook_weblink": latest.outlook_weblink,
+                        "latest_message_id": latest.id,
+                    }
+                )
+            items.append(item)
+    else:
+        # Prefer denormalized last_* fields; only query messages for contacts missing them
+        missing_ids = [c.id for c in contacts if not getattr(c, "last_subject", None)]
+        latest_by_contact = _latest_messages_for_contacts(db, missing_ids) if missing_ids else {}
+        items = [
             _hydrate_list_item(c, latest_by_contact.get(c.id), resolve_from_links=False)
             for c in contacts
-        ],
+        ]
+
+    return {
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,

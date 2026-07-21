@@ -25,6 +25,14 @@ class GmailMailboxConnector:
             raise RuntimeError(f"Unknown mailbox account: {self.account_id}")
         return row
 
+    def _active_sync_run(self) -> SyncRun | None:
+        return (
+            self.db.query(SyncRun)
+            .filter(SyncRun.account_id == self.account_id, SyncRun.status == "running")
+            .order_by(SyncRun.started_at.desc())
+            .first()
+        )
+
     def status(self) -> AccountStatusView:
         account = self._account()
         token = self.gmail.get_token_row()
@@ -44,7 +52,6 @@ class GmailMailboxConnector:
             )
         try:
             self.gmail.ensure_access_token()
-            account.status = "connected"
             account.is_stub = False
             perms = account.permissions_json or {
                 "read_mail": True,
@@ -53,6 +60,22 @@ class GmailMailboxConnector:
                 "drafts": True,
             }
             account.permissions_json = perms
+            if self._active_sync_run():
+                account.status = "syncing"
+                self.db.commit()
+                return AccountStatusView(
+                    account_id=self.account_id,
+                    status="syncing",
+                    connected=True,
+                    last_sync_at=account.last_sync_at,
+                    last_sync_plain=account.last_sync_plain,
+                    permissions=perms,
+                    plain_message="Syncing…",
+                    can_send=bool(perms.get("send")),
+                    is_stub=False,
+                    partial_permissions=False,
+                )
+            account.status = "connected"
             self.db.commit()
             return AccountStatusView(
                 account_id=self.account_id,

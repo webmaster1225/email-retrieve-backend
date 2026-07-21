@@ -23,12 +23,34 @@ from app.services.evidence_assembler import (
     validate_evidence_items,
 )
 from app.services.goal_ranker import classify_contact
+from app.services.careers_classifier import classify_careers_sender, is_recruiting_noise
 
 logger = logging.getLogger(__name__)
 
 
 class Gate1NotApprovedError(Exception):
     pass
+
+
+def _careers_only_noise(
+    contact: Contact,
+    evidence: list[dict[str, Any]],
+    account_ids: list[str],
+) -> bool:
+    """G-02: when Careers is in scope, block recruiting volume from candidate pools."""
+    if "careers" not in account_ids:
+        return False
+    sources = {e.get("source_account") for e in evidence}
+    if sources and sources <= {"careers"}:
+        subjects = [e.get("subject") or "" for e in evidence]
+        cls = classify_careers_sender(
+            email=contact.primary_email,
+            name=contact.full_name,
+            subjects=subjects,
+            company=contact.company_name,
+        )
+        return is_recruiting_noise(cls)
+    return False
 
 
 def require_approved_plan(db: Session, campaign: Campaign) -> PlanVersion:
@@ -119,8 +141,13 @@ def run_campaign_research(db: Session, campaign_id: str) -> Campaign:
             )
             if not evidence and (contact.email_count or 0) < 1:
                 continue
+            if _careers_only_noise(contact, evidence, account_ids):
+                continue
             labels = classify_contact(contact, plan=plan)
             if "excluded_role" in (labels.get("flags") or []):
+                continue
+            if "functional" in (labels.get("flags") or []) and "careers" in account_ids:
+                # Soft-exclude functional Careers relationships from top pool
                 continue
             ranked.append((contact, labels, evidence))
 

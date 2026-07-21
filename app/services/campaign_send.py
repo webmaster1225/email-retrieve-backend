@@ -36,7 +36,15 @@ def confirm_sending_account(
     careers_justification: str | None = None,
 ) -> Campaign:
     allowed = set(campaign.account_ids or [])
-    if account_id not in allowed and account_id not in ("edge", "galaxy", "careers", "northwyn"):
+    # Gate 5: sending account must be one of the campaign's scoped mailboxes
+    # (or explicitly Careers with justification).
+    if allowed and account_id not in allowed:
+        if account_id != "careers":
+            raise SendGateError(
+                f"Sending account '{account_id}' is not in this campaign's mailbox scope",
+                400,
+            )
+    if account_id not in ("edge", "galaxy", "careers", "northwyn"):
         raise SendGateError("Unknown sending account", 400)
     if account_id == "careers" and not (careers_justification or "").strip():
         raise SendGateError("Careers mailbox requires an explicit justification", 400)
@@ -54,6 +62,170 @@ def confirm_sending_account(
     db.commit()
     db.refresh(campaign)
     return campaign
+
+
+def set_draft_sending_override(
+    db: Session,
+    campaign_id: str,
+    *,
+    draft_id: str,
+    account_id: str | None,
+) -> CampaignDraft:
+    """Per-recipient Gate 5 override (G-10)."""
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise SendGateError("Campaign not found", 404)
+    draft = (
+        db.query(CampaignDraft)
+        .filter(CampaignDraft.id == draft_id, CampaignDraft.campaign_id == campaign_id)
+        .one_or_none()
+    )
+    if not draft:
+        raise SendGateError("Draft not found", 404)
+    if account_id:
+        allowed = set(campaign.account_ids or []) | {campaign.sending_account_id or ""}
+        if account_id not in ("edge", "galaxy", "careers", "northwyn"):
+            raise SendGateError("Unknown sending account", 400)
+        if allowed and account_id not in allowed and account_id != campaign.sending_account_id:
+            raise SendGateError("Override account not in campaign scope", 400)
+    draft.sending_account_override = account_id
+    audit(
+        db,
+        campaign_id,
+        "draft_sending_override",
+        f"Draft {draft_id} sending override → {account_id or 'campaign default'}",
+        {"draft_id": draft_id, "account_id": account_id},
+    )
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+def build_preflight(db: Session, campaign_id: str) -> dict[str, Any]:
+    """Stage 11 attention list before Save / Schedule / Send."""
+    from datetime import timedelta
+
+    from app.models.campaign import ExternalFact
+
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise SendGateError("Campaign not found", 404)
+
+    candidates = (
+        db.query(CampaignCandidate)
+        .filter(
+            CampaignCandidate.campaign_id == campaign_id,
+            CampaignCandidate.decision == "include",
+        )
+        .all()
+    )
+    drafts = (
+        db.query(CampaignDraft)
+        .filter(
+            CampaignDraft.campaign_id == campaign_id,
+            CampaignDraft.variant == "email",
+        )
+        .all()
+    )
+    draft_by_cand = {d.candidate_id: d for d in drafts if d.candidate_id}
+
+    by_role: dict[str, int] = {}
+    missing_email: list[dict[str, str]] = []
+    recently_messaged: list[dict[str, Any]] = []
+    call_better: list[dict[str, str]] = []
+    needs_review: list[dict[str, str]] = []
+    duplicates: list[dict[str, str]] = []
+    seen_emails: dict[str, str] = {}
+
+    cutoff = datetime.utcnow() - timedelta(days=30)
+
+    for cand in candidates:
+        role = cand.role_label or "other"
+        by_role[role] = by_role.get(role, 0) + 1
+        email = (cand.email or "").strip().lower()
+        if not email or "@" not in email:
+            missing_email.append({"id": cand.id, "name": cand.full_name or "Unknown"})
+        elif email in seen_emails:
+            duplicates.append(
+                {
+                    "id": cand.id,
+                    "name": cand.full_name or email,
+                    "duplicate_of": seen_emails[email],
+                }
+            )
+        else:
+            seen_emails[email] = cand.full_name or email
+
+        flags = cand.flags or []
+        if "strong_relationship" in (cand.strength_label or "") or "call" in " ".join(flags):
+            if cand.strength_label in ("strong_relationship", "needs_reconnection") and (
+                cand.rank_score or 0
+            ) >= 55:
+                call_better.append({"id": cand.id, "name": cand.full_name or email})
+
+        draft = draft_by_cand.get(cand.id)
+        if draft and draft.status not in ("approved",):
+            needs_review.append(
+                {"id": cand.id, "name": cand.full_name or email, "draft_status": draft.status}
+            )
+
+        if email:
+            recent = None
+            if cand.contact_id:
+                from app.models.contact import ContactEmailLink
+                from app.models.message import EmailMessage
+
+                recent = (
+                    db.query(EmailMessage.id)
+                    .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
+                    .filter(
+                        ContactEmailLink.contact_id == cand.contact_id,
+                        EmailMessage.sent_datetime >= cutoff,
+                        EmailMessage.direction == "outbound",
+                    )
+                    .limit(1)
+                    .first()
+                )
+            if recent:
+                recently_messaged.append(
+                    {"id": cand.id, "name": cand.full_name or email, "email": email}
+                )
+
+    facts_used = (
+        db.query(ExternalFact)
+        .filter(
+            ExternalFact.campaign_id == campaign_id,
+            ExternalFact.status == "approved",
+        )
+        .count()
+    )
+
+    return {
+        "objective": campaign.objective_raw,
+        "title": campaign.title,
+        "recipient_count": len(candidates),
+        "by_role": by_role,
+        "searched_accounts": list(campaign.account_ids or []),
+        "sending_account": campaign.sending_account_id,
+        "sending_confirmed": bool(campaign.sending_account_confirmed_at),
+        "research_mode": campaign.research_mode,
+        "strategy_notes": (campaign.strategy_json or {}).get("notes")
+        if isinstance(campaign.strategy_json, dict)
+        else None,
+        "external_facts_approved": facts_used,
+        "attention": {
+            "missing_email": missing_email,
+            "recently_messaged": recently_messaged,
+            "call_better": call_better,
+            "needs_review": needs_review,
+            "duplicates": duplicates,
+        },
+        "ready_to_save": bool(
+            campaign.sending_account_confirmed_at
+            and not missing_email
+            and all(d.status == "approved" for d in drafts if d.variant == "email")
+        ),
+    }
 
 
 async def save_drafts_to_mailbox(db: Session, campaign_id: str) -> list[dict[str, Any]]:

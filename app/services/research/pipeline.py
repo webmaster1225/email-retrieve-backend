@@ -184,6 +184,9 @@ def run_external_research(
         raise ValueError("Campaign not found")
 
     mode = (campaign.research_mode or "relationship_only").lower()
+    # Normalize UI aliases
+    if mode in ("light_standard", "light-standard"):
+        mode = "light"
     campaign.external_research_status = "running"
     campaign.external_research_progress = "Preparing external research…"
     campaign.status = "external_research"
@@ -195,8 +198,13 @@ def run_external_research(
 
     if mode == "relationship_only":
         prov: ResearchProvider = RelationshipOnlyProvider()
+        max_facts_per_person = 0
+        dig_deeper = False
     else:
+        # light / standard / enhanced share provider seam; depth differs
         prov = provider or get_research_provider()
+        max_facts_per_person = {"light": 1, "standard": 3, "enhanced": 6}.get(mode, 2)
+        dig_deeper = mode == "enhanced"
 
     included = (
         db.query(CampaignCandidate)
@@ -220,7 +228,19 @@ def run_external_research(
             title=cand.role_label,
         )
         hits = prov.search_person(identity)
+        if dig_deeper and hasattr(prov, "search_person"):
+            # Enhanced: second pass with title-heavy query (same provider)
+            alt = IdentitySignature(
+                name=cand.full_name,
+                org=cand.company,
+                email=cand.email,
+                domain=(cand.email or "").split("@")[-1] if cand.email else None,
+                title=(cand.role_label or "") + " interview OR announcement",
+            )
+            hits = hits + prov.search_person(alt)
         proposals = hits_to_proposed_facts(cand, hits)
+        if max_facts_per_person and len(proposals) > max_facts_per_person:
+            proposals = proposals[:max_facts_per_person]
         if not proposals:
             # Honest empty result — no fabricated facts
             continue

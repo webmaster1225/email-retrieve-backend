@@ -591,6 +591,45 @@ def set_sending_account(
     return campaign_service.campaign_to_dict(db, campaign)
 
 
+class DraftOverrideIn(BaseModel):
+    account_id: str | None = None
+
+
+@router.post("/{campaign_id}/drafts/{draft_id}/sending-account")
+def set_draft_sending_account(
+    campaign_id: str,
+    draft_id: str,
+    body: DraftOverrideIn,
+    db: Session = Depends(get_db),
+):
+    """Per-recipient Gate 5 override (G-10)."""
+    _require_compass()
+    _get_campaign(db, campaign_id)
+    from app.services.campaign_send import SendGateError, set_draft_sending_override
+    from app.services.campaign_drafting import draft_to_dict
+
+    try:
+        draft = set_draft_sending_override(
+            db, campaign_id, draft_id=draft_id, account_id=body.account_id
+        )
+    except SendGateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return draft_to_dict(draft)
+
+
+@router.get("/{campaign_id}/preflight")
+def campaign_preflight(campaign_id: str, db: Session = Depends(get_db)):
+    """Stage 11 attention list before Save / Schedule / Send."""
+    _require_compass()
+    _get_campaign(db, campaign_id)
+    from app.services.campaign_send import SendGateError, build_preflight
+
+    try:
+        return build_preflight(db, campaign_id)
+    except SendGateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
 @router.post("/{campaign_id}/drafts/save-to-mailbox")
 async def save_to_mailbox(campaign_id: str, db: Session = Depends(get_db)):
     _require_compass()

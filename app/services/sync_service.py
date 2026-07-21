@@ -193,6 +193,31 @@ class SyncService:
                 self.db.refresh(run)
         return runs
 
+    def stop_active_sync(self, reason: str = "Stopped by user") -> SyncRun | None:
+        """Stop this mailbox's running sync (cooperative cancel)."""
+        run = (
+            self.db.query(SyncRun)
+            .filter(SyncRun.status == "running", SyncRun.account_id == self.account_id)
+            .order_by(SyncRun.started_at.desc())
+            .first()
+        )
+        if not run:
+            self._clear_syncing_status()
+            self.db.commit()
+            return None
+        now = datetime.utcnow()
+        run.status = "failed"
+        run.error_message = reason
+        run.completed_at = now
+        self._clear_syncing_status()
+        self.db.commit()
+        self.db.refresh(run)
+        return run
+
+    def _was_cancelled(self, sync_run: SyncRun) -> bool:
+        self.db.refresh(sync_run)
+        return sync_run.status != "running"
+
     def _fail_stale_running(self) -> None:
         hours = get_settings().sync_stale_hours
         if hours <= 0:
@@ -325,6 +350,9 @@ class SyncService:
 
         try:
             while True:
+                if self._was_cancelled(sync_run):
+                    return
+
                 if next_page_task is not None:
                     page = await next_page_task
                     next_page_task = None
@@ -359,6 +387,11 @@ class SyncService:
                     rebuild_contact_aggregates(self.db, list(touched_contact_ids))
                     touched_contact_ids.clear()
 
+                if self._was_cancelled(sync_run):
+                    if next_page_task is not None:
+                        next_page_task.cancel()
+                    return
+
                 sync_run.messages_fetched = messages_fetched
                 sync_run.messages_new = messages_new
                 sync_run.checkpoint_url = next_url
@@ -369,6 +402,9 @@ class SyncService:
                 if not next_url:
                     break
                 url = next_url
+
+            if self._was_cancelled(sync_run):
+                return
 
             if touched_contact_ids:
                 updated_count = rebuild_contact_aggregates(self.db, list(touched_contact_ids))
@@ -383,9 +419,12 @@ class SyncService:
         except Exception as exc:
             if next_page_task is not None:
                 next_page_task.cancel()
+            if self._was_cancelled(sync_run):
+                return
             sync_run.status = "failed"
             sync_run.error_message = str(exc)
             sync_run.completed_at = datetime.utcnow()
+            self._clear_syncing_status()
             self.db.commit()
             raise
 
@@ -403,6 +442,12 @@ class SyncService:
         account.updated_at = now
         self.db.commit()
 
+    def _clear_syncing_status(self) -> None:
+        account = self.db.get(MailboxAccount, self.account_id)
+        if account and account.status == "syncing":
+            account.status = "connected"
+            account.updated_at = datetime.utcnow()
+
     async def run_inbox_sync(self, sync_run_id: str) -> None:
         sync_run = self.db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
         touched_contact_ids: set[str] = set()
@@ -414,6 +459,9 @@ class SyncService:
 
         try:
             while True:
+                if self._was_cancelled(sync_run):
+                    return
+
                 if next_page_task is not None:
                     page = await next_page_task
                     next_page_task = None
@@ -438,6 +486,11 @@ class SyncService:
                     rebuild_contact_aggregates(self.db, list(touched_contact_ids))
                     touched_contact_ids.clear()
 
+                if self._was_cancelled(sync_run):
+                    if next_page_task is not None:
+                        next_page_task.cancel()
+                    return
+
                 sync_run.messages_fetched = messages_fetched
                 sync_run.messages_new = messages_new
                 sync_run.checkpoint_url = next_url
@@ -448,6 +501,9 @@ class SyncService:
                 if not next_url:
                     break
                 url = next_url
+
+            if self._was_cancelled(sync_run):
+                return
 
             if touched_contact_ids:
                 updated_count = rebuild_contact_aggregates(self.db, list(touched_contact_ids))
@@ -463,9 +519,12 @@ class SyncService:
         except Exception as exc:
             if next_page_task is not None:
                 next_page_task.cancel()
+            if self._was_cancelled(sync_run):
+                return
             sync_run.status = "failed"
             sync_run.error_message = str(exc)
             sync_run.completed_at = datetime.utcnow()
+            self._clear_syncing_status()
             self.db.commit()
             raise
 
@@ -512,6 +571,92 @@ class SyncService:
         self.db.refresh(sync_run)
         return sync_run
 
+    async def run_gmail_sync(self, sync_run_id: str, *, folder: str = "sent") -> None:
+        """Import Gmail Sent (or Inbox) into EmailMessage with source_account=northwyn."""
+        from app.services.gmail_client import GmailAuthError, GmailClient, gmail_message_to_graph_shape
+
+        sync_run = self.db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
+        gmail = GmailClient(self.db, account_id=self.account_id)
+        try:
+            gmail.ensure_access_token()
+        except GmailAuthError:
+            sync_run.status = "failed"
+            sync_run.error_message = "Gmail not authenticated"
+            sync_run.completed_at = datetime.utcnow()
+            self._clear_syncing_status()
+            self.db.commit()
+            raise
+
+        query = "in:inbox" if folder == "inbox" else "in:sent"
+        direction = "inbound" if folder == "inbox" else "outbound"
+        page_token: str | None = None
+        messages_fetched = sync_run.messages_fetched or 0
+        messages_new = sync_run.messages_new or 0
+        touched_contact_ids: set[str] = set()
+        max_pages = 50  # safety cap (~5k messages at 100/page)
+
+        try:
+            for _ in range(max_pages):
+                if self._was_cancelled(sync_run):
+                    return
+
+                listing = await gmail.list_message_refs(
+                    query=query, page_token=page_token, max_results=50
+                )
+                refs = listing.get("messages") or []
+                if not refs:
+                    break
+
+                values: list[dict] = []
+                for ref in refs:
+                    raw = await gmail.fetch_message(ref["id"], format="full")
+                    values.append(gmail_message_to_graph_shape(raw, direction=direction))
+
+                if direction == "inbound":
+                    messages_fetched, messages_new, batch = await self._process_inbound_page(
+                        values, messages_fetched=messages_fetched, messages_new=messages_new
+                    )
+                else:
+                    messages_fetched, messages_new, batch = await self._process_outbound_page(
+                        values, messages_fetched=messages_fetched, messages_new=messages_new
+                    )
+                touched_contact_ids.update(batch)
+
+                sync_run.messages_fetched = messages_fetched
+                sync_run.messages_new = messages_new
+                sync_run.checkpoint_url = listing.get("nextPageToken")
+                self.db.commit()
+
+                page_token = listing.get("nextPageToken")
+                if not page_token:
+                    break
+                await asyncio.sleep(0)
+
+            if self._was_cancelled(sync_run):
+                return
+
+            updated_count = (
+                rebuild_contact_aggregates(self.db, list(touched_contact_ids))
+                if touched_contact_ids
+                else 0
+            )
+            sync_run.status = "completed"
+            sync_run.completed_at = datetime.utcnow()
+            sync_run.contacts_updated = updated_count
+            self.db.commit()
+            self._mark_account_synced()
+            if folder == "inbox":
+                self._refresh_campaign_tracking()
+        except Exception as exc:
+            if self._was_cancelled(sync_run):
+                return
+            sync_run.status = "failed"
+            sync_run.error_message = str(exc)
+            sync_run.completed_at = datetime.utcnow()
+            self._clear_syncing_status()
+            self.db.commit()
+            raise
+
 
 async def run_sync_in_background(db_factory, sync_run_id: str) -> None:
     db = db_factory()
@@ -519,7 +664,11 @@ async def run_sync_in_background(db_factory, sync_run_id: str) -> None:
         sync_run = db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
         account_id = sync_run.account_id or "edge"
         service = SyncService(db, account_id=account_id)
-        if sync_run.sync_type == "inbox":
+        # Northwyn / Gmail path
+        if account_id == "northwyn":
+            folder = "inbox" if sync_run.sync_type == "inbox" else "sent"
+            await service.run_gmail_sync(sync_run_id, folder=folder)
+        elif sync_run.sync_type == "inbox":
             await service.run_inbox_sync(sync_run_id)
         else:
             await service.run_full_sync(sync_run_id)

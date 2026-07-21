@@ -34,6 +34,14 @@ class GraphMailboxConnector:
             raise RuntimeError(f"Unknown mailbox account: {self.account_id}")
         return row
 
+    def _active_sync_run(self) -> SyncRun | None:
+        return (
+            self.db.query(SyncRun)
+            .filter(SyncRun.account_id == self.account_id, SyncRun.status == "running")
+            .order_by(SyncRun.started_at.desc())
+            .first()
+        )
+
     def status(self) -> AccountStatusView:
         account = self._account()
         token = (
@@ -81,6 +89,26 @@ class GraphMailboxConnector:
             plain = None
             if partial:
                 plain = "Connected — can draft, can't send until Mail.Send is granted"
+
+            # Keep "syncing" while a SyncRun is active — list_accounts polls status()
+            # frequently and must not wipe this back to "connected".
+            if self._active_sync_run():
+                account.status = "syncing"
+                account.permissions_json = perms
+                self.db.commit()
+                return AccountStatusView(
+                    account_id=self.account_id,
+                    status="syncing",
+                    connected=True,
+                    last_sync_at=account.last_sync_at,
+                    last_sync_plain=account.last_sync_plain,
+                    permissions=perms,
+                    plain_message="Syncing…",
+                    can_send=can_send,
+                    is_stub=False,
+                    partial_permissions=partial,
+                )
+
             account.status = "connected"
             account.permissions_json = perms
             self.db.commit()

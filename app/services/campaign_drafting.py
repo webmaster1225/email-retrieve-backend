@@ -407,6 +407,12 @@ def apply_tone_to_body(body: str, mode: str) -> str:
             body,
             flags=re.I,
         )
+    if mode == "formal":
+        body = body.replace("Hey ", "Hello ")
+        body = body.replace("Hi ", "Hello ")
+        body = re.sub(r"\bI'd love to\b", "I would appreciate the opportunity to", body, flags=re.I)
+        body = re.sub(r"\bThanks!\b", "Thank you.", body, flags=re.I)
+        return body
     return body
 
 

@@ -75,6 +75,17 @@ def classify_contact(
         flags.append("insufficient_evidence")
     if contact.contact_type and "recruit" in (contact.contact_type or "").lower():
         flags.append("functional")
+    else:
+        from app.services.careers_classifier import classify_careers_sender, is_recruiting_noise
+
+        cls = classify_careers_sender(
+            email=contact.primary_email,
+            name=contact.full_name,
+            company=contact.company_name,
+        )
+        if is_recruiting_noise(cls):
+            flags.append("functional")
+            flags.append(f"careers_{cls}")
 
     # Exclusion soft filter
     ctype = (contact.contact_type or "").lower()
