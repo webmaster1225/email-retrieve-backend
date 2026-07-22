@@ -68,6 +68,11 @@ class Campaign(Base):
     message_strategy: Mapped[dict | None] = mapped_column(JSON, default=dict)
     external_research_status: Mapped[str | None] = mapped_column(String(32))
     external_research_progress: Mapped[str | None] = mapped_column(Text)
+    # P7 drafting progress (Gate 4)
+    draft_status: Mapped[str | None] = mapped_column(String(32))
+    draft_progress: Mapped[str | None] = mapped_column(Text)
+    draft_done: Mapped[int | None] = mapped_column(Integer, default=0)
+    draft_total: Mapped[int | None] = mapped_column(Integer, default=0)
     # P8
     sending_account_id: Mapped[str | None] = mapped_column(String(32))
     sending_account_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime)

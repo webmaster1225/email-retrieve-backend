@@ -559,6 +559,96 @@ async def generate_drafts(campaign_id: str, db: Session = Depends(get_db)):
     return {"items": [draft_to_dict(d) for d in drafts]}
 
 
+def _drafts_job(campaign_id: str) -> None:
+    import asyncio
+
+    from app.services.campaign_drafting import generate_campaign_drafts
+
+    db = SessionLocal()
+    try:
+        def _cb(done: int, total: int) -> None:
+            c = db.get(Campaign, campaign_id)
+            if not c:
+                return
+            c.draft_done = done
+            c.draft_total = total
+            c.draft_progress = (
+                f"Generated {done} of {total} drafts…" if total else "Preparing drafts…"
+            )
+            db.commit()
+
+        drafts = asyncio.run(
+            generate_campaign_drafts(db, campaign_id, progress_cb=_cb)
+        )
+        c = db.get(Campaign, campaign_id)
+        if c:
+            c.draft_status = "completed"
+            c.draft_done = len(drafts)
+            c.draft_total = len(drafts) or (c.draft_total or 0)
+            c.draft_progress = f"{len(drafts)} draft(s) ready"
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 - surface failure to poller
+        c = db.get(Campaign, campaign_id)
+        if c:
+            c.draft_status = "failed"
+            c.draft_progress = str(exc)
+            db.commit()
+    finally:
+        db.close()
+
+
+@router.post("/{campaign_id}/drafts/generate/start")
+def start_generate_drafts(
+    campaign_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    _require_compass()
+    campaign = _get_campaign(db, campaign_id)
+    if campaign.draft_status == "running":
+        return {
+            "status": "running",
+            "done": campaign.draft_done or 0,
+            "total": campaign.draft_total or 0,
+            "progress": campaign.draft_progress,
+        }
+
+    # Count included candidates up front so the UI can show "0 / N" immediately.
+    total = (
+        db.query(CampaignCandidate)
+        .filter(
+            CampaignCandidate.campaign_id == campaign_id,
+            CampaignCandidate.decision == "include",
+        )
+        .count()
+    )
+    campaign.draft_status = "running"
+    campaign.draft_done = 0
+    campaign.draft_total = total
+    campaign.draft_progress = f"Generating {total} draft(s)…"
+    campaign.status = "drafting"
+    db.commit()
+    background_tasks.add_task(_drafts_job, campaign_id)
+    return {
+        "status": "running",
+        "done": 0,
+        "total": total,
+        "progress": campaign.draft_progress,
+    }
+
+
+@router.get("/{campaign_id}/drafts/generate/status")
+def generate_drafts_status(campaign_id: str, db: Session = Depends(get_db)):
+    _require_compass()
+    campaign = _get_campaign(db, campaign_id)
+    return {
+        "status": campaign.draft_status or "idle",
+        "done": campaign.draft_done or 0,
+        "total": campaign.draft_total or 0,
+        "progress": campaign.draft_progress,
+    }
+
+
 @router.get("/{campaign_id}/drafts")
 def list_drafts(campaign_id: str, db: Session = Depends(get_db)):
     _require_compass()

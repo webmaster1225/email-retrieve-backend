@@ -29,7 +29,7 @@ ACCOUNT_HINTS: dict[str, list[str]] = {
 }
 
 
-DEFAULT_CANDIDATE_LIMIT = 30
+DEFAULT_CANDIDATE_LIMIT = 5
 MIN_CANDIDATE_LIMIT = 5
 MAX_CANDIDATE_LIMIT = 100
 
@@ -249,7 +249,7 @@ async def parse_objective(
             "You parse relationship-outreach objectives into JSON only. "
             "Return a single JSON object with keys: goal_type, beneficiary_entity, "
             "target_roles (array), geo, exclusions (array), lookback_years (int), "
-            "candidate_limit (int, how many top-ranked people to surface, default 30, "
+            "candidate_limit (int, how many top-ranked people to surface, default 5, "
             "allowed range 5–100), "
             "priority_weights (object), recommended_accounts (subset of edge,galaxy,northwyn — "
             "never include careers unless the user explicitly asks), assumptions (array), "

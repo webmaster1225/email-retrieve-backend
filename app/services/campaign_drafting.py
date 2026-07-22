@@ -6,11 +6,12 @@ Reviewer meta (email counts, citable-message tallies) stays out of the body.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -21,6 +22,10 @@ from app.services.conversation_mining import extract_salient_sentence
 from app.services.research.pipeline import facts_usable_in_drafts
 
 logger = logging.getLogger(__name__)
+
+# How many LLM draft calls to run at once. Anthropic tolerates modest parallelism;
+# this turns N sequential network round-trips into ceil(N / _DRAFT_CONCURRENCY).
+_DRAFT_CONCURRENCY = 6
 
 BANNED_PHRASES = [
     "i researched you",
@@ -359,6 +364,56 @@ def _campaign_goal_type(campaign: Campaign) -> str | None:
     return None
 
 
+async def _compose_draft_data(
+    cand: CampaignCandidate,
+    *,
+    strategy: dict[str, Any],
+    evidence: list[EvidenceItem],
+    facts: list[ExternalFact],
+    linkedin_url: str | None,
+    variant: str,
+    goal_type: str | None,
+) -> dict[str, Any]:
+    """Slow part only (LLM network / heuristic). No DB access — safe to run concurrently."""
+    draft_data = await _llm_draft(
+        cand,
+        strategy=strategy,
+        evidence=evidence,
+        facts=facts,
+        linkedin_url=linkedin_url,
+        variant=variant,
+        goal_type=goal_type,
+    )
+    if not draft_data:
+        draft_data = _heuristic_draft(
+            cand,
+            strategy=strategy,
+            evidence=evidence,
+            facts=facts,
+            linkedin_url=linkedin_url,
+            variant=variant,
+            goal_type=goal_type,
+        )
+    return draft_data
+
+
+def _draft_row_from_data(
+    campaign_id: str, cand_id: str, draft_data: dict[str, Any], *, variant: str
+) -> CampaignDraft:
+    return CampaignDraft(
+        campaign_id=campaign_id,
+        candidate_id=cand_id,
+        subject=draft_data["subject"],
+        body=draft_data["body"],
+        status="generated",
+        lifecycle="approved_pending",
+        provenance=draft_data["provenance"],
+        ask=draft_data.get("ask"),
+        warnings=draft_data.get("warnings") or [],
+        variant=variant,
+    )
+
+
 async def _build_one_draft(
     db: Session,
     campaign: Campaign,
@@ -371,7 +426,7 @@ async def _build_one_draft(
     linkedin = get_settings().linkedin_signature_url or None
     evidence = list(cand.evidence_items or [])
     goal_type = _campaign_goal_type(campaign)
-    draft_data = await _llm_draft(
+    draft_data = await _compose_draft_data(
         cand,
         strategy=strategy,
         evidence=evidence,
@@ -380,32 +435,22 @@ async def _build_one_draft(
         variant=variant,
         goal_type=goal_type,
     )
-    if not draft_data:
-        draft_data = _heuristic_draft(
-            cand,
-            strategy=strategy,
-            evidence=evidence,
-            facts=facts,
-            linkedin_url=linkedin,
-            variant=variant,
-            goal_type=goal_type,
-        )
     assert_provenance_facts_allowed(db, campaign.id, draft_data["provenance"])
-    return CampaignDraft(
-        campaign_id=campaign.id,
-        candidate_id=cand.id,
-        subject=draft_data["subject"],
-        body=draft_data["body"],
-        status="generated",
-        lifecycle="approved_pending",
-        provenance=draft_data["provenance"],
-        ask=draft_data.get("ask"),
-        warnings=draft_data.get("warnings") or [],
-        variant=variant,
-    )
+    return _draft_row_from_data(campaign.id, cand.id, draft_data, variant=variant)
 
 
-async def generate_campaign_drafts(db: Session, campaign_id: str) -> list[CampaignDraft]:
+async def generate_campaign_drafts(
+    db: Session,
+    campaign_id: str,
+    *,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> list[CampaignDraft]:
+    """Generate one draft per included candidate.
+
+    LLM calls run concurrently (bounded by _DRAFT_CONCURRENCY) so total wall time is
+    roughly ceil(N / concurrency) round-trips instead of N. ``progress_cb(done, total)``
+    is invoked from the event loop after each draft is persisted.
+    """
     campaign = db.get(Campaign, campaign_id)
     if not campaign:
         raise ValueError("Campaign not found")
@@ -413,6 +458,8 @@ async def generate_campaign_drafts(db: Session, campaign_id: str) -> list[Campai
     facts_by_cand: dict[str, list[ExternalFact]] = {}
     for f in usable_facts:
         facts_by_cand.setdefault(f.candidate_id, []).append(f)
+    # Compute allowed fact ids once instead of a DB query per candidate.
+    allowed_fact_ids = {f.id for f in usable_facts}
 
     db.query(CampaignDraft).filter(CampaignDraft.campaign_id == campaign_id).delete()
     db.flush()
@@ -427,14 +474,54 @@ async def generate_campaign_drafts(db: Session, campaign_id: str) -> list[Campai
         .order_by(CampaignCandidate.rank.asc())
         .all()
     )
+    total = len(included)
+
+    strategy = dict(campaign.message_strategy or {})
+    linkedin = get_settings().linkedin_signature_url or None
+    goal_type = _campaign_goal_type(campaign)
+    cand_by_id = {c.id: c for c in included}
+
+    sem = asyncio.Semaphore(_DRAFT_CONCURRENCY)
+
+    async def _compose(cand: CampaignCandidate) -> tuple[str, dict[str, Any]]:
+        async with sem:
+            evidence = list(cand.evidence_items or [])
+            data = await _compose_draft_data(
+                cand,
+                strategy=strategy,
+                evidence=evidence,
+                facts=facts_by_cand.get(cand.id, []),
+                linkedin_url=linkedin,
+                variant="email",
+                goal_type=goal_type,
+            )
+            return cand.id, data
+
+    tasks = [asyncio.create_task(_compose(c)) for c in included]
+
     created: list[CampaignDraft] = []
-    for cand in included:
-        row = await _build_one_draft(
-            db, campaign, cand, variant="email", facts=facts_by_cand.get(cand.id, [])
-        )
+    done = 0
+    if progress_cb:
+        progress_cb(0, total)
+    # Persist in completion order; DB writes happen here on the event loop (single
+    # threaded), so the shared Session is only ever touched by one coroutine at a time.
+    for coro in asyncio.as_completed(tasks):
+        cand_id, draft_data = await coro
+        for fid in draft_data["provenance"].get("fact_ids") or []:
+            if fid not in allowed_fact_ids:
+                raise ValueError(
+                    f"Unapproved external fact cannot appear in draft provenance: {fid}"
+                )
+        row = _draft_row_from_data(campaign_id, cand_id, draft_data, variant="email")
         db.add(row)
         created.append(row)
-        cand.tracking_status = "drafted"
+        cand = cand_by_id.get(cand_id)
+        if cand:
+            cand.tracking_status = "drafted"
+        done += 1
+        if progress_cb:
+            progress_cb(done, total)
+
     campaign.status = "reviewing_drafts"
     audit(db, campaign_id, "drafts_generated", f"Generated {len(created)} draft(s)", {})
     db.commit()

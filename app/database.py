@@ -342,6 +342,22 @@ def run_migrations() -> None:
                     "careers_justification",
                     "ALTER TABLE campaigns ADD COLUMN careers_justification TEXT",
                 ),
+                (
+                    "draft_status",
+                    "ALTER TABLE campaigns ADD COLUMN draft_status VARCHAR(32)",
+                ),
+                (
+                    "draft_progress",
+                    "ALTER TABLE campaigns ADD COLUMN draft_progress TEXT",
+                ),
+                (
+                    "draft_done",
+                    "ALTER TABLE campaigns ADD COLUMN draft_done INTEGER DEFAULT 0",
+                ),
+                (
+                    "draft_total",
+                    "ALTER TABLE campaigns ADD COLUMN draft_total INTEGER DEFAULT 0",
+                ),
             ]
             for name, sql in alters:
                 if name not in camp_cols:
