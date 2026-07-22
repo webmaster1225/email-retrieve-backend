@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+from app.services.objective_parser import (
+    DEFAULT_CANDIDATE_LIMIT,
+    clamp_candidate_limit,
+)
 
 ACCOUNT_LABELS = {
     "edge": "Edge Investing",
@@ -20,6 +26,9 @@ def build_plan(
     revision_note: str | None = None,
 ) -> dict[str, Any]:
     lookback = int(parsed.get("lookback_years") or 5)
+    candidate_limit = clamp_candidate_limit(
+        parsed.get("candidate_limit"), DEFAULT_CANDIDATE_LIMIT
+    )
     roles = list(parsed.get("target_roles") or [])
     exclusions = list(parsed.get("exclusions") or [])
     entity = parsed.get("beneficiary_entity")
@@ -38,6 +47,7 @@ def build_plan(
         "account_ids": accounts,
         "lookback_years": lookback,
         "date_range_label": f"Last {lookback} years",
+        "candidate_limit": candidate_limit,
         "relationship_types": roles,
         "prioritization": (
             "Strong reciprocal relationships first, then goal relevance"
@@ -48,6 +58,11 @@ def build_plan(
         "external_research_later": True,
         "external_research_note": (
             "External web research runs later only for contacts you approve (Gate 3)."
+        ),
+        "suppressed_subjects": list(parsed.get("suppressed_subjects") or []),
+        "noise_filtering": (
+            "Bid Invitation / Collaborative Proposal threads and automated mail "
+            "(calendar, auto-replies, NDRs) are excluded from hooks and strength."
         ),
         "assumptions": list(parsed.get("assumptions") or []),
         "revision_note": revision_note,
@@ -84,6 +99,17 @@ def apply_plan_revision(plan: dict[str, Any], instruction: str) -> dict[str, Any
             out["lookback_years"] = years
             out["date_range_label"] = f"Last {years} years"
             break
+
+    limit_match = re.search(
+        r"\b(?:top|first|only|limit(?:\s+to)?|show|return|surface)\s+(\d{1,3})\s*"
+        r"(?:people|contacts|candidates|results)?\b"
+        r"|\b(\d{1,3})\s+(?:people|contacts|candidates|results)\b"
+        r"|\bcandidate[_\s-]?limit\s*[:=]?\s*(\d{1,3})\b",
+        text,
+    )
+    if limit_match:
+        raw = limit_match.group(1) or limit_match.group(2) or limit_match.group(3)
+        out["candidate_limit"] = clamp_candidate_limit(raw)
 
     if "no external" in text or "relationship only" in text or "relationship-only" in text:
         out["external_research_later"] = False

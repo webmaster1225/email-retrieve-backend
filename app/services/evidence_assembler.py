@@ -1,14 +1,28 @@
-"""P4 — assemble citable evidence; drop uncited claims."""
+"""P4 — assemble citable evidence; drop uncited claims.
+
+Applies conversation suppression (Bid blast / automated) and mines body
+previews for salient human signal before selecting hooks.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy.orm import Session
 
 from app.models.contact import Contact, ContactEmailLink
 from app.models.message import EmailMessage
+from app.services.conversation_mining import (
+    clean_message_body,
+    extract_salient_sentence,
+    mine_hook_line,
+    rank_substantive_messages,
+)
+from app.services.conversation_suppression import (
+    collect_extra_suppressions,
+    is_suppressed_message,
+)
 
 
 def gather_message_evidence(
@@ -17,8 +31,16 @@ def gather_message_evidence(
     *,
     account_ids: list[str],
     limit: int = 8,
+    extra_suppressions: Iterable[str] | None = None,
+    fetch_multiplier: int = 6,
 ) -> list[dict[str, Any]]:
-    """Pull real messages linked to the contact within scoped accounts."""
+    """Pull real messages linked to the contact within scoped accounts.
+
+    Fetches a larger window, drops suppressed/automated mail, mines body text,
+    and ranks by two-way + substance + recency (not timestamp alone).
+    """
+    extras = list(extra_suppressions or [])
+    fetch_n = max(limit * fetch_multiplier, 24)
     q = (
         db.query(EmailMessage)
         .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
@@ -26,18 +48,25 @@ def gather_message_evidence(
     )
     if account_ids:
         q = q.filter(EmailMessage.source_account.in_(account_ids))
-    rows = (
-        q.order_by(EmailMessage.sent_datetime.desc())
-        .limit(limit)
-        .all()
-    )
-    items: list[dict[str, Any]] = []
+    rows = q.order_by(EmailMessage.sent_datetime.desc()).limit(fetch_n).all()
+
+    candidates: list[dict[str, Any]] = []
     for msg in rows:
         if not msg.id:
             continue
+        if is_suppressed_message(
+            subject=msg.subject,
+            sender_email=msg.sender_email,
+            extra_patterns=extras,
+        ):
+            continue
         preview = (msg.body_preview or "").strip()
-        summary = preview[:180] if preview else (msg.subject or "Email exchange")
-        items.append(
+        cleaned = clean_message_body(preview)
+        salient = extract_salient_sentence(preview)
+        summary = salient or (cleaned[:180] if cleaned else None) or (
+            msg.subject or "Email exchange"
+        )
+        candidates.append(
             {
                 "kind": "email",
                 "occurred_at": msg.sent_datetime,
@@ -45,12 +74,17 @@ def gather_message_evidence(
                 "direction": msg.direction or "outbound",
                 "subject": msg.subject,
                 "summary": summary,
+                "salient": salient,
+                "body_preview": preview,
                 "message_id": msg.id,
                 "outlook_weblink": msg.outlook_weblink,
                 "citation_ok": True,
+                "conversation_id": msg.conversation_id,
             }
         )
-    return items
+
+    ranked = rank_substantive_messages(candidates)
+    return ranked[:limit]
 
 
 def validate_evidence_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -69,7 +103,7 @@ def validate_evidence_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def build_why_text(contact: Contact, evidence: list[dict[str, Any]]) -> str:
-    """Prose explanation grounded only in cited evidence + contact aggregates."""
+    """Reviewer-facing explanation (not injected into recipient email body)."""
     parts: list[str] = []
     n = len(evidence)
     emails = contact.email_count or 0
@@ -87,16 +121,14 @@ def build_why_text(contact: Contact, evidence: list[dict[str, Any]]) -> str:
         latest = evidence[0]
         when = latest.get("occurred_at")
         when_s = when.strftime("%b %Y") if isinstance(when, datetime) else "recently"
-        subj = latest.get("subject") or "a recent thread"
-        parts.append(f"Most recent cited exchange ({when_s}): {subj}")
+        hook = mine_hook_line(latest)
+        parts.append(f"Best cited exchange ({when_s}): {hook}")
         if n > 1:
             parts.append(f"{n} citable messages support this recommendation")
     elif contact.outreach_score_explanation:
-        # Only use stored explanation if we still have at least aggregate facts
         parts.append("Ranking also reflects your stored outreach analysis")
     if not parts:
         return "Limited mailbox evidence — review carefully before including."
-    # Join into one readable paragraph
     text = parts[0]
     for p in parts[1:]:
         if p[0].islower() or p.startswith("from ") or p.startswith("to "):
@@ -113,3 +145,7 @@ def drop_uncited_claims_from_why(why: str, evidence: list[dict[str, Any]]) -> st
     if evidence:
         return why
     return "Limited mailbox evidence — review carefully before including."
+
+
+def plan_extra_suppressions(plan: dict[str, Any] | None) -> list[str]:
+    return collect_extra_suppressions(plan)

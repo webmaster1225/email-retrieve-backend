@@ -1,4 +1,8 @@
-"""P7 — campaign drafting with provenance chips and banned-phrase lint."""
+"""P7 — campaign drafting with provenance chips and banned-phrase lint.
+
+Drafts lead with one mined email signal (+ optional approved public fact).
+Reviewer meta (email counts, citable-message tallies) stays out of the body.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import get_settings
 from app.models.campaign import Campaign, CampaignCandidate, CampaignDraft, EvidenceItem, ExternalFact
 from app.services.campaign_service import audit
+from app.services.conversation_mining import extract_salient_sentence
 from app.services.research.pipeline import facts_usable_in_drafts
 
 logger = logging.getLogger(__name__)
@@ -26,12 +31,62 @@ BANNED_PHRASES = [
     "i found online that",
 ]
 
+# Meta scaffolding that must never appear in recipient-facing body
+META_SCAFFOLDING_RE = re.compile(
+    r"(you exchanged about \d+ emails|"
+    r"\d+ citable messages|"
+    r"most recent cited exchange|"
+    r"best cited exchange|"
+    r"support this recommendation)",
+    re.I,
+)
+
 VALID_VARIANTS = {"email", "call_script", "linkedin"}
+
+ASK_BY_GOAL: dict[str, dict[str, str]] = {
+    "fundraising": {
+        "solid": "Would you have 15 minutes to compare notes on the current raise?",
+        "needs_reconnection": "Would a short catch-up call in the next couple of weeks work?",
+        "weak_relationship": "Open to a brief intro call if the timing is right?",
+        "default": "Would you have 15 minutes to discuss the capital raise?",
+    },
+    "reconnect": {
+        "solid": "Any chance of a short call in the next couple of weeks?",
+        "needs_reconnection": "Would love 15 minutes to reconnect when you have a window.",
+        "default": "Would you have 15 minutes soon?",
+    },
+    "revive": {
+        "default": "Would a short catch-up be useful in the next few weeks?",
+    },
+    "find_expert": {
+        "default": "Could I get 15 minutes to tap your expertise on this?",
+    },
+    "find_partners": {
+        "default": "Open to 15 minutes to see whether a partnership still fits?",
+    },
+    "customer_intros": {
+        "default": "Would you have 15 minutes to explore a possible intro?",
+    },
+}
 
 
 def lint_banned_phrases(body: str) -> list[str]:
     lower = (body or "").lower()
     return [p for p in BANNED_PHRASES if p in lower]
+
+
+def strip_meta_scaffolding(body: str) -> str:
+    """Remove reviewer meta that accidentally leaked into the draft body."""
+    if not body:
+        return body
+    lines = []
+    for para in body.split("\n"):
+        if META_SCAFFOLDING_RE.search(para):
+            continue
+        lines.append(para)
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def ensure_linkedin_signature(body: str, url: str | None, *, variant: str = "email") -> str:
@@ -42,6 +97,55 @@ def ensure_linkedin_signature(body: str, url: str | None, *, variant: str = "ema
     return (body or "").rstrip() + f"\n\nLinkedIn: {url}"
 
 
+def _evidence_hook(evidence: list[EvidenceItem]) -> str:
+    """Human hook from mined summary — not raw Bid-spam subjects."""
+    if not evidence:
+        return "our last exchange"
+    e0 = evidence[0]
+    salient = extract_salient_sentence(e0.summary) if e0.summary else None
+    if salient and not _looks_like_raw_subject_hook(salient, e0.subject):
+        return salient.rstrip(".")
+    subj = (e0.subject or "our last exchange").strip()
+    if subj.lower().startswith(("re:", "fw:", "fwd:")):
+        subj = re.sub(r"^(re|fw|fwd):\s*", "", subj, flags=re.I).strip() or subj
+    return subj
+
+
+def _looks_like_raw_subject_hook(text: str, subject: str | None) -> bool:
+    if not subject:
+        return False
+    return text.strip().lower() == subject.strip().lower()
+
+
+def _resolve_ask(
+    strategy: dict[str, Any],
+    *,
+    goal_type: str | None,
+    strength_label: str | None,
+) -> str:
+    custom = (strategy.get("ask") or "").strip()
+    if custom:
+        return custom
+    goal = (goal_type or "other").lower()
+    strength = (strength_label or "default").lower()
+    bucket = ASK_BY_GOAL.get(goal) or ASK_BY_GOAL.get("reconnect", {})
+    return (
+        bucket.get(strength)
+        or bucket.get("default")
+        or "Would you have 15 minutes soon?"
+    )
+
+
+def _fact_line(facts: list[ExternalFact]) -> tuple[str, list[str]]:
+    for f in facts:
+        if f.status == "approved" and (f.confidence or "").lower() != "low":
+            claim = (f.claim or "").strip().rstrip(".")
+            if not claim:
+                continue
+            return (f" Congratulations again on {claim}.", [f.id])
+    return ("", [])
+
+
 def _heuristic_draft(
     cand: CampaignCandidate,
     *,
@@ -50,65 +154,79 @@ def _heuristic_draft(
     facts: list[ExternalFact],
     linkedin_url: str | None,
     variant: str = "email",
+    goal_type: str | None = None,
 ) -> dict[str, Any]:
-    ask = (strategy.get("ask") or "Would you have 15 minutes to reconnect?").strip()
+    ask = _resolve_ask(
+        strategy,
+        goal_type=goal_type,
+        strength_label=cand.strength_label,
+    )
     notes = (strategy.get("notes") or "").strip()
-    why = cand.why_text or "our past correspondence"
     first = (cand.full_name or "there").split()[0]
-    ev_line = ""
-    if evidence:
-        e0 = evidence[0]
-        ev_line = f"I still remember {e0.subject or 'our last exchange'}"
-        if e0.occurred_at:
-            ev_line += f" ({e0.occurred_at.strftime('%b %Y')})"
-        ev_line += "."
-    fact_line = ""
-    public_ids: list[str] = []
-    for f in facts:
-        if f.status == "approved":
-            fact_line = f" Congrats on the recent development — {f.claim[:120]}"
-            public_ids.append(f.id)
-            break
+    hook = _evidence_hook(evidence)
+    mined = bool(evidence and extract_salient_sentence(evidence[0].summary))
+    if evidence and mined:
+        ev_line = f"When we last traded notes — {hook}."
+    elif evidence:
+        ev_line = f"I've been thinking back to {hook}."
+    else:
+        ev_line = "I hope you're well."
+
+    fact_line, public_ids = _fact_line(facts)
 
     if variant == "call_script":
         subject = f"Call script — {cand.full_name or first}"
         body = (
             f"OPENING\nHi {first}, thanks for taking the call.\n\n"
-            f"CONTEXT\n{ev_line} {why}\n\n"
+            f"CONTEXT\n{ev_line}{fact_line}\n\n"
             f"{('NOTES\n' + notes + chr(10) + chr(10)) if notes else ''}"
-            f"ASK\n{ask}{fact_line}\n\n"
+            f"ASK\n{ask}\n\n"
             f"CLOSE\nAppreciate your time — I'll send a short note after."
         )
     elif variant == "linkedin":
         subject = f"LinkedIn DM — {cand.full_name or first}"
-        body = (
-            f"Hi {first} — {ev_line or 'good to reconnect.'} {ask}{fact_line}"
-        ).strip()
+        body = f"Hi {first} — {ev_line} {ask}{fact_line}".strip()
         if len(body) > 300:
             body = body[:297] + "…"
     else:
         subject = f"Reconnecting — {cand.full_name or 'hello'}"
         body = (
             f"Hi {first},\n\n"
-            f"I hope you're well. {ev_line} {why}\n\n"
+            f"I hope you're well. {ev_line}{fact_line}\n\n"
             f"{notes + chr(10) + chr(10) if notes else ''}"
-            f"{ask}{fact_line}\n\n"
+            f"{ask}\n\n"
             f"Best regards"
         )
         body = ensure_linkedin_signature(body, linkedin_url, variant=variant)
 
+    body = strip_meta_scaffolding(body)
     warnings = lint_banned_phrases(body)
+    chips = []
+    for e in evidence[:4]:
+        label = extract_salient_sentence(e.summary) or e.subject or "Email"
+        chips.append(
+            {
+                "kind": "private",
+                "label": (label[:80] + ("…" if len(label) > 80 else "")),
+                "id": e.id,
+                "message_id": e.message_id,
+            }
+        )
+    for f in facts:
+        if f.id in public_ids:
+            chips.append(
+                {
+                    "kind": "public",
+                    "label": (f.claim[:60] + "…") if f.claim and len(f.claim) > 60 else (f.claim or ""),
+                    "id": f.id,
+                }
+            )
     provenance = {
         "evidence_ids": [e.id for e in evidence[:6]],
+        "message_ids": [e.message_id for e in evidence[:6] if e.message_id],
         "fact_ids": public_ids,
-        "chips": (
-            [{"kind": "private", "label": e.subject or "Email", "id": e.id} for e in evidence[:4]]
-            + [
-                {"kind": "public", "label": (f.claim[:60] + "…"), "id": f.id}
-                for f in facts
-                if f.id in public_ids
-            ]
-        ),
+        "chips": chips,
+        "hook_source": "mined_summary" if mined else "subject",
     }
     return {
         "subject": subject,
@@ -128,6 +246,7 @@ async def _llm_draft(
     facts: list[ExternalFact],
     linkedin_url: str | None,
     variant: str = "email",
+    goal_type: str | None = None,
 ) -> dict[str, Any] | None:
     settings = get_settings()
     if not settings.anthropic_api_key:
@@ -136,11 +255,17 @@ async def _llm_draft(
         from app.services.ai_service import _call_anthropic
         import json
 
+        ask = _resolve_ask(
+            strategy,
+            goal_type=goal_type,
+            strength_label=cand.strength_label,
+        )
         ev_blob = "\n".join(
-            f"- [{e.id}] {e.occurred_at}: {e.subject} — {e.summary}" for e in evidence[:6]
+            f"- [message_id={e.message_id}] {e.occurred_at}: {e.subject} — {e.summary}"
+            for e in evidence[:6]
         )
         fact_blob = "\n".join(
-            f"- [{f.id}] ({f.status}) {f.claim}"
+            f"- [{f.id}] ({f.status}, confidence={f.confidence}) {f.claim}"
             for f in facts
             if f.status in ("approved", "background")
         )
@@ -150,8 +275,11 @@ async def _llm_draft(
             "linkedin": "very short LinkedIn DM (under 300 chars)",
         }.get(variant, "short professional outreach email")
         system = (
-            f"Write a {channel}. Lead with relationship history. "
-            "Use at most one approved public fact. Never use banned surveillance phrasing "
+            f"Write a {channel}. Lead with ONE mined relationship signal from the evidence "
+            "summaries (real words / topics — never invent). "
+            "Use at most one approved public fact with Medium/High confidence. "
+            "Never mention email counts, 'citable messages', or confidence scores in the body. "
+            "Never use banned surveillance phrasing "
             f"({', '.join(BANNED_PHRASES)}). "
             "Return JSON: subject, body, ask. "
         )
@@ -159,8 +287,11 @@ async def _llm_draft(
             system += f"End the body with LinkedIn: {linkedin_url or '(omit if none)'}."
         user = (
             f"Recipient: {cand.full_name} <{cand.email}> at {cand.company}\n"
-            f"Strategy notes: {strategy.get('notes')}\nAsk: {strategy.get('ask')}\n"
-            f"Evidence:\n{ev_blob}\nPublic facts (approved only for body):\n{fact_blob}\n"
+            f"Goal type: {goal_type or 'other'}\n"
+            f"Relationship strength: {cand.strength_label}\n"
+            f"Strategy notes: {strategy.get('notes')}\nAsk suggestion: {ask}\n"
+            f"Evidence (use summary text, not just subject):\n{ev_blob}\n"
+            f"Public facts (approved only for body; withhold Low confidence):\n{fact_blob}\n"
         )
         raw = await _call_anthropic(system, user)
         raw = raw.strip()
@@ -171,23 +302,38 @@ async def _llm_draft(
         body = ensure_linkedin_signature(
             str(data.get("body") or ""), linkedin_url, variant=variant
         )
+        body = strip_meta_scaffolding(body)
         warnings = lint_banned_phrases(body)
-        approved_facts = [f for f in facts if f.status == "approved"]
+        approved_facts = [
+            f
+            for f in facts
+            if f.status == "approved" and (f.confidence or "").lower() != "low"
+        ][:1]
         provenance = {
             "evidence_ids": [e.id for e in evidence[:6]],
-            "fact_ids": [f.id for f in approved_facts[:1]],
+            "message_ids": [e.message_id for e in evidence[:6] if e.message_id],
+            "fact_ids": [f.id for f in approved_facts],
             "chips": (
-                [{"kind": "private", "label": e.subject or "Email", "id": e.id} for e in evidence[:4]]
+                [
+                    {
+                        "kind": "private",
+                        "label": (extract_salient_sentence(e.summary) or e.subject or "Email")[:80],
+                        "id": e.id,
+                        "message_id": e.message_id,
+                    }
+                    for e in evidence[:4]
+                ]
                 + [
-                    {"kind": "public", "label": f.claim[:60], "id": f.id}
-                    for f in approved_facts[:1]
+                    {"kind": "public", "label": (f.claim or "")[:60], "id": f.id}
+                    for f in approved_facts
                 ]
             ),
+            "hook_source": "llm_mined",
         }
         return {
             "subject": data.get("subject") or f"Reconnecting — {cand.full_name}",
             "body": body,
-            "ask": data.get("ask") or strategy.get("ask"),
+            "ask": data.get("ask") or ask,
             "warnings": warnings,
             "provenance": provenance,
             "variant": variant,
@@ -206,6 +352,13 @@ def assert_provenance_facts_allowed(
             raise ValueError(f"Unapproved external fact cannot appear in draft provenance: {fid}")
 
 
+def _campaign_goal_type(campaign: Campaign) -> str | None:
+    parsed = campaign.objective_parsed or {}
+    if isinstance(parsed, dict) and parsed.get("goal_type"):
+        return str(parsed["goal_type"])
+    return None
+
+
 async def _build_one_draft(
     db: Session,
     campaign: Campaign,
@@ -217,6 +370,7 @@ async def _build_one_draft(
     strategy = dict(campaign.message_strategy or {})
     linkedin = get_settings().linkedin_signature_url or None
     evidence = list(cand.evidence_items or [])
+    goal_type = _campaign_goal_type(campaign)
     draft_data = await _llm_draft(
         cand,
         strategy=strategy,
@@ -224,6 +378,7 @@ async def _build_one_draft(
         facts=facts,
         linkedin_url=linkedin,
         variant=variant,
+        goal_type=goal_type,
     )
     if not draft_data:
         draft_data = _heuristic_draft(
@@ -233,6 +388,7 @@ async def _build_one_draft(
             facts=facts,
             linkedin_url=linkedin,
             variant=variant,
+            goal_type=goal_type,
         )
     assert_provenance_facts_allowed(db, campaign.id, draft_data["provenance"])
     return CampaignDraft(
@@ -346,9 +502,9 @@ def change_ask(db: Session, campaign_id: str, draft_id: str, ask: str) -> Campai
         linkedin = get_settings().linkedin_signature_url or None
         body = ensure_linkedin_signature(body, linkedin, variant=draft.variant or "email")
     draft.ask = ask
-    draft.body = body
+    draft.body = strip_meta_scaffolding(body)
     draft.status = "edited"
-    draft.warnings = lint_banned_phrases(body)
+    draft.warnings = lint_banned_phrases(draft.body)
     draft.updated_at = datetime.utcnow()
     campaign = db.get(Campaign, campaign_id)
     if campaign:
@@ -370,6 +526,12 @@ def remove_public_refs(db: Session, campaign_id: str, draft_id: str) -> Campaign
     chips = [c for c in (prov.get("chips") or []) if c.get("kind") != "public"]
     body = draft.body or ""
     body = re.sub(
+        r"\s*Congrats(?:ulations)? again on[^.]*\.",
+        "",
+        body,
+        flags=re.I,
+    )
+    body = re.sub(
         r"\s*Congrats on the recent development[^.]*\.",
         "",
         body,
@@ -380,7 +542,7 @@ def remove_public_refs(db: Session, campaign_id: str, draft_id: str) -> Campaign
     prov["fact_ids"] = []
     prov["chips"] = chips
     draft.provenance = prov
-    draft.body = body.strip()
+    draft.body = strip_meta_scaffolding(body.strip())
     draft.status = "edited"
     draft.warnings = lint_banned_phrases(draft.body)
     draft.updated_at = datetime.utcnow()
@@ -429,7 +591,7 @@ def apply_tone(
         q = q.filter(CampaignDraft.id == draft_id)
     rows = q.all()
     for row in rows:
-        row.body = apply_tone_to_body(row.body, mode)
+        row.body = strip_meta_scaffolding(apply_tone_to_body(row.body, mode))
         row.status = "edited"
         row.warnings = lint_banned_phrases(row.body)
         row.updated_at = datetime.utcnow()

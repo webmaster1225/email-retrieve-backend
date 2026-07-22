@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.models.campaign import Campaign, CampaignCandidate, ExternalFact
 from app.services.campaign_service import audit
@@ -208,6 +208,7 @@ def run_external_research(
 
     included = (
         db.query(CampaignCandidate)
+        .options(joinedload(CampaignCandidate.evidence_items))
         .filter(
             CampaignCandidate.campaign_id == campaign_id,
             CampaignCandidate.decision == "include",
@@ -239,8 +240,16 @@ def run_external_research(
             )
             hits = hits + prov.search_person(alt)
         proposals = hits_to_proposed_facts(cand, hits)
-        if max_facts_per_person and len(proposals) > max_facts_per_person:
-            proposals = proposals[:max_facts_per_person]
+        # Mine mailbox-derived capital/governance signals (fills fact_ids even
+        # when web providers return empty — grounded to message_id).
+        mailbox_props = mailbox_derived_facts_for_candidate(cand)
+        if mode == "relationship_only":
+            proposals = mailbox_props[:1]
+        else:
+            if mailbox_props:
+                proposals = mailbox_props + proposals
+            if max_facts_per_person and len(proposals) > max_facts_per_person:
+                proposals = proposals[:max_facts_per_person]
         if not proposals:
             # Honest empty result — no fabricated facts
             continue
@@ -289,8 +298,11 @@ def run_external_research(
 
 
 def facts_usable_in_drafts(db: Session, campaign_id: str) -> list[ExternalFact]:
-    """Server gate: only approved (or background-only as soft) facts reach drafting."""
-    return (
+    """Server gate: only identity-confirmed approved/background facts reach drafting.
+
+    Low-confidence facts are withheld from the recipient body (audit: withhold, don't guess).
+    """
+    rows = (
         db.query(ExternalFact)
         .filter(
             ExternalFact.campaign_id == campaign_id,
@@ -299,3 +311,60 @@ def facts_usable_in_drafts(db: Session, campaign_id: str) -> list[ExternalFact]:
         )
         .all()
     )
+    return [f for f in rows if (f.confidence or "Medium").lower() != "low"]
+
+
+# Capital / governance signals already present in mailbox evidence (audit Gap 3)
+_MAILBOX_PUBLIC_SIGNAL_RE = re.compile(
+    r"\b(fund\s+(?:i{1,3}v?|iv|v|vi|close|closing|raise)|"
+    r"closed\s+fund|announces?\s+its\s+fund|"
+    r"board\s+(?:seat|appointment|director)|"
+    r"co-?invest(?:ment)?|series\s+[a-d]\b|"
+    r"acquisition|merger|ipo)\b",
+    re.I,
+)
+
+
+def mailbox_derived_facts_for_candidate(
+    candidate: CampaignCandidate,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Propose one public-style fact from genuine evidence when the thread itself
+    mentions a capital/governance event — grounded to message_id, not invented.
+    """
+    now = now or datetime.utcnow()
+    proposed: list[dict[str, Any]] = []
+    for ev in list(candidate.evidence_items or [])[:8]:
+        blob = f"{ev.subject or ''} {ev.summary or ''}"
+        if not _MAILBOX_PUBLIC_SIGNAL_RE.search(blob):
+            continue
+        claim = (ev.summary or ev.subject or "").strip()
+        if len(claim) < 20:
+            continue
+        # Soft identity: fact is from the contact's own thread
+        proposed.append(
+            {
+                "claim": claim[:280],
+                "sources": [
+                    {
+                        "title": ev.subject or "Mailbox exchange",
+                        "publisher": "mailbox",
+                        "url": ev.outlook_weblink or f"message:{ev.message_id}",
+                        "pub_date": ev.occurred_at.isoformat() if ev.occurred_at else None,
+                        "event_date": ev.occurred_at.isoformat() if ev.occurred_at else None,
+                        "retrieved_at": now.isoformat(),
+                        "message_id": ev.message_id,
+                    }
+                ],
+                "publication_date": ev.occurred_at,
+                "event_date": ev.occurred_at,
+                "confidence": "Medium",
+                "identity_confirmed": True,
+                "quarantined_reason": None,
+                "status": "proposed",
+                "recommended_use": "Optional one-line personalization from your own thread.",
+            }
+        )
+        break  # one fact per person
+    return proposed

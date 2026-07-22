@@ -16,6 +16,7 @@ from app.models.campaign import (
 )
 from app.models.contact import Contact, ContactEmailLink
 from app.models.message import EmailMessage
+from app.services.conversation_suppression import collect_extra_suppressions
 from app.services.evidence_assembler import (
     build_why_text,
     drop_uncited_claims_from_why,
@@ -24,6 +25,10 @@ from app.services.evidence_assembler import (
 )
 from app.services.goal_ranker import classify_contact
 from app.services.careers_classifier import classify_careers_sender, is_recruiting_noise
+from app.services.objective_parser import (
+    DEFAULT_CANDIDATE_LIMIT,
+    clamp_candidate_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +117,11 @@ def run_campaign_research(db: Session, campaign_id: str) -> Campaign:
     plan = dict(plan_row.plan_json or {})
     account_ids = list(plan.get("account_ids") or campaign.account_ids or [])
     lookback = int(plan.get("lookback_years") or 5)
+    candidate_limit = clamp_candidate_limit(
+        plan.get("candidate_limit"), DEFAULT_CANDIDATE_LIMIT
+    )
+    # Pull a wider pool than the final cut so ranking has room to discriminate.
+    pool_limit = max(100, candidate_limit * 3)
 
     campaign.research_status = "running"
     campaign.research_progress = "Reviewing relationship history…"
@@ -127,32 +137,44 @@ def run_campaign_research(db: Session, campaign_id: str) -> Campaign:
         db.flush()
 
         contacts = _contacts_in_scope(
-            db, account_ids=account_ids, lookback_years=lookback, limit=100
+            db, account_ids=account_ids, lookback_years=lookback, limit=pool_limit
         )
         campaign.research_progress = (
             f"Found {len(contacts)} potentially relevant people, ranking…"
         )
         db.commit()
 
+        extras = collect_extra_suppressions(plan)
+        strategy = dict(campaign.message_strategy or {})
+        extras.extend(collect_extra_suppressions(strategy))
+
         ranked: list[tuple[Contact, dict[str, Any], list[dict[str, Any]]]] = []
         for contact in contacts:
             evidence = validate_evidence_items(
-                gather_message_evidence(db, contact, account_ids=account_ids)
+                gather_message_evidence(
+                    db,
+                    contact,
+                    account_ids=account_ids,
+                    extra_suppressions=extras,
+                )
             )
             if not evidence and (contact.email_count or 0) < 1:
                 continue
             if _careers_only_noise(contact, evidence, account_ids):
                 continue
-            labels = classify_contact(contact, plan=plan)
+            labels = classify_contact(contact, plan=plan, evidence=evidence)
             if "excluded_role" in (labels.get("flags") or []):
                 continue
             if "functional" in (labels.get("flags") or []) and "careers" in account_ids:
                 # Soft-exclude functional Careers relationships from top pool
                 continue
+            # Drop contacts whose only recent volume was suppressed noise
+            if "blast_only_or_no_signal" in (labels.get("flags") or []) and not evidence:
+                continue
             ranked.append((contact, labels, evidence))
 
         ranked.sort(key=lambda t: t[1]["rank_score"], reverse=True)
-        top = ranked[:40]
+        top = ranked[:candidate_limit]
 
         for idx, (contact, labels, evidence) in enumerate(top, start=1):
             why = drop_uncited_claims_from_why(
@@ -163,6 +185,10 @@ def run_campaign_research(db: Session, campaign_id: str) -> Campaign:
                 {e.get("source_account") or "edge" for e in evidence}
             ) or list(account_ids[:1])
 
+            flags = list(labels.get("flags") or [])
+            conf = labels.get("confidence_label")
+            if conf:
+                flags.append(f"confidence_{conf}")
             cand = CampaignCandidate(
                 campaign_id=campaign.id,
                 contact_id=contact.id,
@@ -177,7 +203,7 @@ def run_campaign_research(db: Session, campaign_id: str) -> Campaign:
                 source_accounts=sources,
                 decision="proposed",
                 rank_score=labels["rank_score"],
-                flags=labels.get("flags") or [],
+                flags=flags,
             )
             db.add(cand)
             db.flush()

@@ -59,6 +59,12 @@ class NlOpIn(BaseModel):
     instruction: str = Field(min_length=1)
 
 
+class SuppressThreadIn(BaseModel):
+    subject: str = Field(min_length=1)
+    evidence_id: str | None = None
+    rerun_research: bool = True
+
+
 @router.get("")
 def list_campaigns(db: Session = Depends(get_db), summary: bool = False):
     _require_compass()
@@ -273,6 +279,58 @@ def nl_apply(campaign_id: str, body: NlOpIn, db: Session = Depends(get_db)):
     )
     db.commit()
     return {**result, "campaign": campaign_service.campaign_to_dict(db, campaign)}
+
+
+@router.post("/{campaign_id}/suppress-thread")
+def suppress_thread(
+    campaign_id: str,
+    body: SuppressThreadIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """One-click 'ignore this thread' — seed suppression list and optionally re-research."""
+    _require_compass()
+    campaign = _get_campaign(db, campaign_id)
+    from app.models.campaign import PlanVersion
+    from app.services.conversation_suppression import add_suppression_to_plan
+
+    plan_row = None
+    if campaign.current_plan_version_id:
+        plan_row = db.get(PlanVersion, campaign.current_plan_version_id)
+    if not plan_row:
+        raise HTTPException(status_code=409, detail="No plan to update with suppressions")
+
+    plan = add_suppression_to_plan(dict(plan_row.plan_json or {}), body.subject)
+    plan_row.plan_json = plan
+    # Also keep on message_strategy so drafting/research share the list
+    strategy = dict(campaign.message_strategy or {})
+    strategy = add_suppression_to_plan(strategy, body.subject)
+    campaign.message_strategy = strategy
+    campaign_service.audit(
+        db,
+        campaign_id,
+        "thread_suppressed",
+        f"Ignoring thread: {body.subject[:120]}",
+        {"subject": body.subject, "evidence_id": body.evidence_id},
+    )
+    db.commit()
+
+    if body.rerun_research and plan_row.approved_at:
+        # Recompute candidates/hooks/strength on cleaned set
+        def _job(cid: str) -> None:
+            session = SessionLocal()
+            try:
+                run_campaign_research(session, cid)
+            finally:
+                session.close()
+
+        background_tasks.add_task(_job, campaign_id)
+
+    return {
+        "suppressed_subjects": plan.get("suppressed_subjects") or [],
+        "research_restarted": bool(body.rerun_research and plan_row.approved_at),
+        "campaign": campaign_service.campaign_to_dict(db, campaign),
+    }
 
 
 @router.get("/{campaign_id}/audit")

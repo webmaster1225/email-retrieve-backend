@@ -29,6 +29,19 @@ ACCOUNT_HINTS: dict[str, list[str]] = {
 }
 
 
+DEFAULT_CANDIDATE_LIMIT = 30
+MIN_CANDIDATE_LIMIT = 5
+MAX_CANDIDATE_LIMIT = 100
+
+
+def clamp_candidate_limit(value: Any, default: int = DEFAULT_CANDIDATE_LIMIT) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_CANDIDATE_LIMIT, min(MAX_CANDIDATE_LIMIT, n))
+
+
 def empty_parsed() -> dict[str, Any]:
     return {
         "goal_type": "other",
@@ -37,6 +50,7 @@ def empty_parsed() -> dict[str, Any]:
         "geo": None,
         "exclusions": [],
         "lookback_years": 5,
+        "candidate_limit": DEFAULT_CANDIDATE_LIMIT,
         "priority_weights": {"relationship_strength": 0.45, "goal_relevance": 0.55},
         "recommended_accounts": ["edge", "northwyn"],
         "assumptions": [],
@@ -165,8 +179,20 @@ def parse_objective_heuristic(objective: str, *, round_num: int = 0) -> dict[str
     elif re.search(r"\b(1|one)\s+year\b", text.lower()):
         lookback = 1
 
+    candidate_limit = DEFAULT_CANDIDATE_LIMIT
+    limit_match = re.search(
+        r"\b(?:top|first|only|limit(?:\s+to)?|show|return)\s+(\d{1,3})\s*"
+        r"(?:people|contacts|candidates|results)?\b"
+        r"|\b(\d{1,3})\s+(?:people|contacts|candidates|results)\b",
+        text.lower(),
+    )
+    if limit_match:
+        raw = limit_match.group(1) or limit_match.group(2)
+        candidate_limit = clamp_candidate_limit(raw)
+
     assumptions = [
         f"Look back ~{lookback} years of relationship history",
+        f"Surface the top {candidate_limit} ranked candidates",
         "Prioritize people with reciprocal email history",
         "Careers mailbox stays excluded unless you add it",
     ]
@@ -176,7 +202,8 @@ def parse_objective_heuristic(objective: str, *, round_num: int = 0) -> dict[str
     restatement = (
         f"I'll look for {', '.join(roles)} relationships"
         + (f" relevant to {entity}" if entity else "")
-        + f" across {', '.join(accounts)}, focusing on the last {lookback} years."
+        + f" across {', '.join(accounts)}, focusing on the last {lookback} years"
+        + f", and surface the top {candidate_limit} ranked people."
     )
 
     parsed.update(
@@ -186,6 +213,7 @@ def parse_objective_heuristic(objective: str, *, round_num: int = 0) -> dict[str
             "target_roles": roles,
             "exclusions": exclusions,
             "lookback_years": lookback,
+            "candidate_limit": candidate_limit,
             "recommended_accounts": accounts,
             "assumptions": assumptions,
             "restatement": restatement,
@@ -221,6 +249,8 @@ async def parse_objective(
             "You parse relationship-outreach objectives into JSON only. "
             "Return a single JSON object with keys: goal_type, beneficiary_entity, "
             "target_roles (array), geo, exclusions (array), lookback_years (int), "
+            "candidate_limit (int, how many top-ranked people to surface, default 30, "
+            "allowed range 5–100), "
             "priority_weights (object), recommended_accounts (subset of edge,galaxy,northwyn — "
             "never include careers unless the user explicitly asks), assumptions (array), "
             "clarifying_questions (array, max 3, empty if enough info), restatement (string). "
@@ -247,6 +277,10 @@ async def parse_objective(
         base["clarifying_questions"] = qs
         if base.get("goal_type") not in VALID_GOAL_TYPES:
             base["goal_type"] = _infer_goal_type(objective)
+        base["candidate_limit"] = clamp_candidate_limit(
+            base.get("candidate_limit"), DEFAULT_CANDIDATE_LIMIT
+        )
+        base["lookback_years"] = max(1, int(base.get("lookback_years") or 5))
         return base
     except Exception as exc:
         logger.warning("Objective LLM parse failed, using heuristic: %s", exc)
