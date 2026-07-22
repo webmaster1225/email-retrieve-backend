@@ -209,8 +209,8 @@ def build_preflight(db: Session, campaign_id: str) -> dict[str, Any]:
         "sending_account": campaign.sending_account_id,
         "sending_confirmed": bool(campaign.sending_account_confirmed_at),
         "research_mode": campaign.research_mode,
-        "strategy_notes": (campaign.strategy_json or {}).get("notes")
-        if isinstance(campaign.strategy_json, dict)
+        "strategy_notes": (campaign.message_strategy or {}).get("notes")
+        if isinstance(campaign.message_strategy, dict)
         else None,
         "external_facts_approved": facts_used,
         "attention": {

@@ -82,6 +82,40 @@ def list_campaigns(db: Session = Depends(get_db), summary: bool = False):
     return [campaign_service.campaign_to_dict(db, c) for c in rows]
 
 
+class BulkDeleteIn(BaseModel):
+    ids: list[str] = Field(default_factory=list, min_length=1)
+
+
+def _delete_campaigns(db: Session, ids: list[str]) -> list[str]:
+    """Hard-delete campaigns (and cascaded children). Returns deleted ids."""
+    unique = list(dict.fromkeys(i for i in ids if i))
+    if not unique:
+        return []
+    rows = db.query(Campaign).filter(Campaign.id.in_(unique)).all()
+    deleted: list[str] = []
+    for row in rows:
+        deleted.append(row.id)
+        db.delete(row)
+    db.commit()
+    return deleted
+
+
+@router.post("/bulk-delete")
+def bulk_delete_campaigns(body: BulkDeleteIn, db: Session = Depends(get_db)):
+    _require_compass()
+    deleted = _delete_campaigns(db, body.ids)
+    return {"deleted": deleted, "count": len(deleted)}
+
+
+@router.delete("/{campaign_id}")
+def delete_campaign(campaign_id: str, db: Session = Depends(get_db)):
+    _require_compass()
+    deleted = _delete_campaigns(db, [campaign_id])
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"deleted": deleted, "count": 1}
+
+
 @router.post("")
 async def create_campaign(body: CreateCampaignIn, db: Session = Depends(get_db)):
     _require_compass()
