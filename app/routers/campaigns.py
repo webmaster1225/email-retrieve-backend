@@ -905,13 +905,13 @@ def get_tracking(campaign_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{campaign_id}/tracking/refresh")
-def refresh_tracking(campaign_id: str, db: Session = Depends(get_db)):
+async def refresh_tracking(campaign_id: str, db: Session = Depends(get_db)):
     _require_tracking()
     _get_campaign(db, campaign_id)
-    from app.services.campaign_tracking import refresh_campaign_tracking
+    from app.services.campaign_tracking import refresh_campaign_tracking_async
 
     try:
-        return refresh_campaign_tracking(db, campaign_id)
+        return await refresh_campaign_tracking_async(db, campaign_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -939,12 +939,49 @@ def propose_followups_endpoint(campaign_id: str, db: Session = Depends(get_db)):
     _get_campaign(db, campaign_id)
     from app.services.campaign_followups import propose_followups, _proposal_to_dict
     from app.services.campaign_send import SendGateError
+    from app.models.campaign import CampaignCandidate, SendLog
 
     try:
         rows = propose_followups(db, campaign_id)
     except SendGateError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return {"items": [_proposal_to_dict(r) for r in rows]}
+
+    sent_n = (
+        db.query(SendLog)
+        .filter(SendLog.campaign_id == campaign_id, SendLog.action == "sent")
+        .count()
+    )
+    no_resp = (
+        db.query(CampaignCandidate)
+        .filter(
+            CampaignCandidate.campaign_id == campaign_id,
+            CampaignCandidate.tracking_status == "no_response",
+        )
+        .count()
+    )
+    reason = None
+    if not rows:
+        if sent_n == 0:
+            reason = (
+                "No sent messages logged for this campaign. "
+                "Gate 8 send must complete (FEATURE_COMPASS_SEND=true) before follow-ups."
+            )
+        elif no_resp == 0:
+            from app.config import get_settings
+
+            days = get_settings().followup_no_response_days
+            reason = (
+                f"No contacts marked no-response yet. "
+                f"Refresh replies first; follow-ups appear after {days} days without a reply."
+            )
+        else:
+            reason = "Eligible contacts already have open follow-up proposals."
+
+    return {
+        "items": [_proposal_to_dict(r) for r in rows],
+        "reason": reason,
+        "meta": {"sent_logs": sent_n, "no_response": no_resp},
+    }
 
 
 @router.get("/{campaign_id}/follow-ups")

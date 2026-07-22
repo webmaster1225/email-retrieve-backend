@@ -50,6 +50,12 @@ def propose_followups(db: Session, campaign_id: str) -> list[FollowUpProposal]:
     if not campaign:
         raise SendGateError("Campaign not found", 404)
 
+    # Ensure aged "sent" contacts are promoted before we query no_response
+    from app.services.campaign_tracking import promote_no_response_statuses
+
+    promote_no_response_statuses(db, campaign_id)
+    db.flush()
+
     days = settings.followup_no_response_days
     cutoff = datetime.utcnow() - timedelta(days=days)
     created: list[FollowUpProposal] = []

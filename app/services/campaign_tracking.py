@@ -22,6 +22,10 @@ from app.services.campaign_service import audit
 
 logger = logging.getLogger(__name__)
 
+# How far back refresh pulls inbox when rematching replies
+_INBOX_LOOKBACK_DAYS = 60
+_INBOX_MAX_PAGES = 3
+
 INTRO_RE = re.compile(r"\b(introduc|connect you with|put you in touch)\b", re.I)
 MEETING_RE = re.compile(r"\b(let'?s (meet|talk|schedule)|book a call|calendar invite)\b", re.I)
 DECLINE_RE = re.compile(r"\b(not interested|pass for now|no thank|can'?t help)\b", re.I)
@@ -130,7 +134,136 @@ def _extract_commitments_heuristic(excerpt: str) -> list[dict[str, str]]:
     return out
 
 
+async def pull_recent_inbox(
+    db: Session, account_id: str | None
+) -> tuple[int, str | None]:
+    """Fetch recent inbox pages so reply matching has inbound messages to work with.
+
+    CRM historically synced Sent Items only — without this, refresh always sees 0 inbound.
+    Returns (new_inbound_count, error_or_none). Network failures are soft — caller rematches
+    whatever is already in the DB.
+    """
+    if not account_id:
+        return 0, None
+    since = datetime.utcnow() - timedelta(days=_INBOX_LOOKBACK_DAYS)
+    new_count = 0
+    try:
+        if account_id == "northwyn":
+            from app.services.gmail_client import GmailClient, gmail_message_to_graph_shape
+            from app.services.sync_service import SyncService
+
+            gmail = GmailClient(db, account_id="northwyn")
+            gmail.ensure_access_token()
+            listing = await gmail.list_message_refs(
+                query="in:inbox", page_token=None, max_results=50
+            )
+            refs = listing.get("messages") or []
+            values = []
+            for ref in refs[:50]:
+                raw = await gmail.fetch_message(ref["id"], format="full")
+                values.append(gmail_message_to_graph_shape(raw, direction="inbound"))
+            service = SyncService(db, account_id="northwyn")
+            _, new_count, _ = await service._process_inbound_page(
+                values, messages_fetched=0, messages_new=0
+            )
+            db.commit()
+            return new_count, None
+
+        from app.services.graph_client import GraphClient
+        from app.services.sync_service import SyncService
+
+        graph = GraphClient(db, account_id=account_id)
+        service = SyncService(db, account_id=account_id)
+        url: str | None = None
+        for page_i in range(_INBOX_MAX_PAGES):
+            page = await graph.fetch_inbox_page(url, since=since if page_i == 0 else None)
+            values = page.get("value") or []
+            if not values:
+                break
+            _, page_new, _ = await service._process_inbound_page(
+                values, messages_fetched=0, messages_new=0
+            )
+            new_count += page_new
+            url = page.get("@odata.nextLink")
+            if not url:
+                break
+        db.commit()
+        return new_count, None
+    except Exception as exc:
+        logger.warning(
+            "Inbox pull for tracking failed (account=%s): %s",
+            account_id,
+            exc,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("Rollback after inbox pull failure failed")
+        return 0, f"Inbox sync skipped ({type(exc).__name__}: {exc})"
+
+
+def promote_no_response_statuses(db: Session, campaign_id: str) -> int:
+    """Mark aged sent contacts as no_response. Returns how many were promoted."""
+    settings = get_settings()
+    days = settings.followup_no_response_days
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    sent_logs = (
+        db.query(SendLog)
+        .filter(SendLog.campaign_id == campaign_id, SendLog.action == "sent")
+        .all()
+    )
+    replied_cand_ids = {
+        r.candidate_id
+        for r in db.query(CampaignReply).filter(CampaignReply.campaign_id == campaign_id).all()
+    }
+    promoted = 0
+    for log in sent_logs:
+        if not log.candidate_id or log.candidate_id in replied_cand_ids:
+            continue
+        cand = db.get(CampaignCandidate, log.candidate_id)
+        if not cand:
+            continue
+        if cand.tracking_status in (
+            "replied",
+            "intro_offered",
+            "meeting_booked",
+            "declined",
+            "no_response",
+        ):
+            continue
+        if log.sent_at and log.sent_at <= cutoff:
+            cand.tracking_status = "no_response"
+            promoted += 1
+        elif not cand.tracking_status or cand.tracking_status in ("saved", "scheduled", "drafted"):
+            cand.tracking_status = "sent"
+    return promoted
+
+
 def refresh_campaign_tracking(db: Session, campaign_id: str) -> dict[str, Any]:
+    """Synchronous rematch (no inbox pull). Prefer refresh_campaign_tracking_async."""
+    return _refresh_campaign_tracking_core(db, campaign_id, inbox_new=0)
+
+
+async def refresh_campaign_tracking_async(db: Session, campaign_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    if not settings.feature_compass_tracking:
+        raise ValueError("FEATURE_COMPASS_TRACKING is disabled")
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise ValueError("Campaign not found")
+    inbox_new, inbox_error = await pull_recent_inbox(db, campaign.sending_account_id)
+    return _refresh_campaign_tracking_core(
+        db, campaign_id, inbox_new=inbox_new, inbox_error=inbox_error
+    )
+
+
+def _refresh_campaign_tracking_core(
+    db: Session,
+    campaign_id: str,
+    *,
+    inbox_new: int = 0,
+    inbox_error: str | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
     if not settings.feature_compass_tracking:
         raise ValueError("FEATURE_COMPASS_TRACKING is disabled")
@@ -146,9 +279,6 @@ def refresh_campaign_tracking(db: Session, campaign_id: str) -> dict[str, Any]:
         .all()
     )
 
-    # Mark no_response for aged sent without reply
-    days = settings.followup_no_response_days
-    cutoff = datetime.utcnow() - timedelta(days=days)
     existing_reply_msg_ids = {
         r.message_id
         for r in db.query(CampaignReply).filter(CampaignReply.campaign_id == campaign_id).all()
@@ -197,32 +327,32 @@ def refresh_campaign_tracking(db: Session, campaign_id: str) -> dict[str, Any]:
                 )
             )
 
-    replied_cand_ids = {
-        r.candidate_id
-        for r in db.query(CampaignReply).filter(CampaignReply.campaign_id == campaign_id).all()
-    }
-    for log in sent_logs:
-        if not log.candidate_id or log.candidate_id in replied_cand_ids:
-            continue
-        cand = db.get(CampaignCandidate, log.candidate_id)
-        if not cand:
-            continue
-        if cand.tracking_status in (
-            "replied",
-            "intro_offered",
-            "meeting_booked",
-            "declined",
-        ):
-            continue
-        if log.sent_at and log.sent_at <= cutoff:
-            cand.tracking_status = "no_response"
-        elif not cand.tracking_status or cand.tracking_status in ("saved", "scheduled", "drafted"):
-            cand.tracking_status = "sent"
+    promote_no_response_statuses(db, campaign_id)
 
     campaign.status = "tracking"
-    audit(db, campaign_id, "tracking_refreshed", f"Matched {matched} new reply(ies)", {})
+    audit(
+        db,
+        campaign_id,
+        "tracking_refreshed",
+        f"Matched {matched} new reply(ies); inbox +{inbox_new}"
+        + (f" ({inbox_error})" if inbox_error else ""),
+        {
+            "matched": matched,
+            "inbox_new": inbox_new,
+            "sent_logs": len(sent_logs),
+            "inbox_error": inbox_error,
+        },
+    )
     db.commit()
-    return tracking_dashboard(db, campaign_id)
+    dash = tracking_dashboard(db, campaign_id)
+    dash["refresh_meta"] = {
+        "matched_new": matched,
+        "inbox_new": inbox_new,
+        "sent_logs": len(sent_logs),
+        "inbound_scanned": len(inbound),
+        "inbox_error": inbox_error,
+    }
+    return dash
 
 
 def tracking_dashboard(db: Session, campaign_id: str) -> dict[str, Any]:
@@ -311,12 +441,17 @@ def tracking_dashboard(db: Session, campaign_id: str) -> dict[str, Any]:
             }
             for c in commitments
         ],
-        "suggestions": _suggestions(counts, commitments),
+        "suggestions": _suggestions(counts, commitments, sent_logs=sent_count),
     }
 
 
-def _suggestions(counts: dict[str, int], commitments: list[CampaignCommitment]) -> list[str]:
+def _suggestions(counts: dict[str, int], commitments: list[CampaignCommitment], *, sent_logs: int = 0) -> list[str]:
     out: list[str] = []
+    if sent_logs == 0 and (counts.get("sent") or 0) == 0 and (counts.get("no_response") or 0) == 0:
+        out.append(
+            "No campaign sends logged yet — authorize Gate 8 send "
+            "(FEATURE_COMPASS_SEND=true) before reply matching or follow-ups can run"
+        )
     if counts.get("no_response"):
         out.append(
             f"{counts['no_response']} no-response after "
