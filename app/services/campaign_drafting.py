@@ -94,6 +94,39 @@ def strip_meta_scaffolding(body: str) -> str:
     return text.strip()
 
 
+# Placeholder scaffolding an LLM sometimes leaves behind (e.g. [Your Name], (omit if none)).
+_PLACEHOLDER_TOKEN_RE = re.compile(r"\[[^\]\n]{0,60}\]")
+_OMIT_HINT_RE = re.compile(r"\(omit if none\)", re.I)
+
+
+def strip_ai_placeholders(text: str) -> str:
+    """Remove obvious AI scaffolding so drafts read as finished, human-written text.
+
+    Strips bracketed placeholders like ``[Your Name]`` and drops a trailing
+    ``LinkedIn:`` line that has no real URL (e.g. ``LinkedIn: (omit if none)``).
+    """
+    if not text:
+        return text
+    cleaned: list[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.lower().startswith("linkedin:"):
+            after = stripped.split(":", 1)[1].strip()
+            if (
+                not after
+                or _OMIT_HINT_RE.search(after)
+                or _PLACEHOLDER_TOKEN_RE.fullmatch(after)
+            ):
+                continue  # drop placeholder LinkedIn line entirely
+        line = _PLACEHOLDER_TOKEN_RE.sub("", line)
+        line = _OMIT_HINT_RE.sub("", line)
+        cleaned.append(line.rstrip())
+    text = "\n".join(cleaned)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def ensure_linkedin_signature(body: str, url: str | None, *, variant: str = "email") -> str:
     if variant != "email" or not url:
         return body
@@ -287,6 +320,10 @@ async def _llm_draft(
             "Never use banned surveillance phrasing "
             f"({', '.join(BANNED_PHRASES)}). "
             "Return JSON: subject, body, ask. "
+            "Write only finished text the sender could send as-is. "
+            "Sign off simply (e.g. 'Best,') WITHOUT a name — the sender's signature is "
+            "appended automatically. Never include placeholder tokens of any kind, such as "
+            "[Your Name], [Name], [Company], [Title], or '(omit if none)'. "
         )
         if variant == "email":
             system += f"End the body with LinkedIn: {linkedin_url or '(omit if none)'}."
@@ -394,6 +431,10 @@ async def _compose_draft_data(
             variant=variant,
             goal_type=goal_type,
         )
+    # Final safety net: strip any AI placeholder scaffolding that slipped through.
+    draft_data["body"] = strip_ai_placeholders(draft_data.get("body") or "")
+    if draft_data.get("subject"):
+        draft_data["subject"] = strip_ai_placeholders(str(draft_data["subject"]))
     return draft_data
 
 

@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     azure_client_secret: str = ""
     azure_tenant_id: str = "common"
     azure_redirect_uri: str = "http://localhost:8000/api/v1/auth/callback"
-    graph_scopes: str = "Mail.Read,Mail.Send,User.Read"
+    graph_scopes: str = "Mail.Read,Mail.Send,User.Read,Mail.ReadWrite"
 
     # Database (override in Azure: sqlite:////home/data/crm.db)
     # WARNING: SQLite + multiple App Service instances = split-brain / lost writes.
